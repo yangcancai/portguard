@@ -1,0 +1,121 @@
+name: Package PortGuard Server
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian12
+            image: debian:12
+            platform: linux/amd64
+          - distro: ubuntu2204
+            image: ubuntu:22.04
+            platform: linux/amd64
+          - distro: ubuntu2404
+            image: ubuntu:24.04
+            platform: linux/amd64
+          - distro: rocky8
+            image: rockylinux:8
+            platform: linux/amd64
+          - distro: rocky9
+            image: rockylinux:9
+            platform: linux/amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+          docker pull --platform "${{ matrix.platform }}" "${{ matrix.image }}"
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -e PORTGUARD_PACKAGE_RELEASE="${PORTGUARD_PACKAGE_RELEASE}" \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/dist:/dist" \
+            "${{ matrix.image }}" \
+            bash /src/scripts/build-package.sh \
+              --source /src \
+              --output /dist \
+              --distro "${{ matrix.distro }}"
+        env:
+          PORTGUARD_PACKAGE_RELEASE: ${{ github.ref_type == 'tag' && github.ref_name || format('dev{0}', github.run_number) }}
+
+      - name: Verify package
+        run: |
+          set -Eeuo pipefail
+          package="$(find dist -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) | sort | tail -n 1)"
+          test -n "$package"
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/dist:/dist:ro" \
+            "${{ matrix.image }}" \
+            bash /src/scripts/verify-package.sh \
+              --package "/dist/$(basename "$package")"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portguard-server-${{ matrix.distro }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          set -Eeuo pipefail
+          mkdir -p release
+          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} release/ \;
+          scripts/generate-release-manifest.sh \
+            --dist release \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+
+      - name: Upload release assets
+        run: |
+          set -Eeuo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/* \
+              --verify-tag \
+              --title "PortGuard Server ${GITHUB_REF_NAME}" \
+              --notes "Automated PortGuard Server packages for Debian, Ubuntu, and Rocky Linux."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
