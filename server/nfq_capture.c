@@ -102,6 +102,8 @@ nfq_capture(fko_srv_options_t *opts)
     struct nfq_q_handle *nfq_qh;
     struct nfnl_handle  *nfq_nh;
 
+    opts->payload_starts_at_ip = 1;
+
     nfq_h = nfq_open();
     if (!nfq_h) {
         log_msg(LOG_ERR, "[*] nfq_open error\n");
@@ -278,6 +280,7 @@ nfq_capture(fko_srv_options_t *opts)
 
     nfq_destroy_queue(nfq_qh);
     nfq_close(nfq_h);
+    opts->payload_starts_at_ip = 0;
 
     return(0);
 }
