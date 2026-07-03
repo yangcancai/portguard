@@ -23,6 +23,9 @@ jobs:
           - distro: debian12
             image: debian:12
             platform: linux/amd64
+          - distro: debian13
+            image: debian:13
+            platform: linux/amd64
           - distro: ubuntu2204
             image: ubuntu:22.04
             platform: linux/amd64
