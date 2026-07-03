@@ -143,24 +143,49 @@ default_distro() {
 }
 
 run_container() {
+  local tmp_dist
+
   [ -n "$SDK_IMAGE" ] || SDK_IMAGE="openwrt/sdk:${SDK_ARCH}"
   log "using SDK image ${SDK_IMAGE}"
 
-  docker pull --platform "$SDK_PLATFORM" "$SDK_IMAGE"
-  docker run --rm \
-    --platform "$SDK_PLATFORM" \
-    -e PORTGUARD_PACKAGE_RELEASE="$PACKAGE_RELEASE" \
-    -v "${SOURCE_DIR}:/src:ro" \
-    -v "${OUTPUT_DIR}:/dist" \
-    "$SDK_IMAGE" \
-    bash /src/scripts/build-openwrt-package.sh \
-      --inside-sdk \
-      --source /src \
-      --output /dist \
-      --version "$PACKAGE_VERSION" \
-      --release "$PACKAGE_RELEASE" \
-      --sdk-arch "$SDK_ARCH" \
-      --distro "$DISTRO"
+  tmp_dist="$(mktemp -d "${TMPDIR:-/tmp}/portguard-openwrt-dist.XXXXXX")"
+  chmod 0777 "$tmp_dist"
+
+  (
+    trap 'rm -rf "$tmp_dist"' EXIT
+
+    docker pull --platform "$SDK_PLATFORM" "$SDK_IMAGE"
+    docker run --rm \
+      --platform "$SDK_PLATFORM" \
+      -e PORTGUARD_PACKAGE_RELEASE="$PACKAGE_RELEASE" \
+      -v "${SOURCE_DIR}:/src:ro" \
+      -v "${tmp_dist}:/dist" \
+      "$SDK_IMAGE" \
+      bash /src/scripts/build-openwrt-package.sh \
+        --inside-sdk \
+        --source /src \
+        --output /dist \
+        --version "$PACKAGE_VERSION" \
+        --release "$PACKAGE_RELEASE" \
+        --sdk-arch "$SDK_ARCH" \
+        --distro "$DISTRO"
+
+    copy_host_packages "$tmp_dist"
+  )
+}
+
+copy_host_packages() {
+  local dist_dir="$1"
+  local package copied=0
+
+  while IFS= read -r package; do
+    [ -n "$package" ] || continue
+    cp "$package" "${OUTPUT_DIR}/$(basename "$package")"
+    log "wrote ${OUTPUT_DIR}/$(basename "$package")"
+    copied=1
+  done < <(find "$dist_dir" -maxdepth 1 -type f -name '*.ipk' | sort)
+
+  [ "$copied" = "1" ] || die "OpenWrt SDK did not export any .ipk packages"
 }
 
 copy_openwrt_package() {
