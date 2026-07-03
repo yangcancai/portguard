@@ -178,7 +178,7 @@ install_build_deps_debian() {
   retry apt-get install -y --no-install-recommends \
     bash ca-certificates tar gzip coreutils findutils sed grep gawk \
     make gcc libc6-dev autoconf automake libtool pkg-config \
-    texinfo iptables dpkg-dev
+    iptables dpkg-dev
 }
 
 install_build_deps_rhel() {
@@ -188,9 +188,9 @@ install_build_deps_rhel() {
   fi
 
   retry "$pm" install -y \
-    bash ca-certificates tar gzip coreutils findutils sed grep gawk \
+    bash ca-certificates tar gzip findutils sed grep gawk which \
     make gcc autoconf automake libtool pkgconfig \
-    texinfo iptables rpm-build
+    iptables rpm-build
 }
 
 install_build_deps() {
@@ -206,6 +206,14 @@ install_build_deps() {
 }
 
 prepare_source_tree() {
+  if [ -f Makefile.am ]; then
+    log "removing doc subdir from package build"
+    sed -i.bak \
+      -e '/^[[:space:]]*doc[[:space:]]*$/d' \
+      -e '/^[[:space:]]*\$(SERVER_DIR)[[:space:]]*\\[[:space:]]*$/s/[[:space:]]*\\[[:space:]]*$//' \
+      Makefile.am
+  fi
+
   if [ -f doc/Makefile.am ] && grep -q '^AUTOMAKE_OPTIONS[[:space:]]*=[[:space:]]*info-in-builddir' doc/Makefile.am; then
     log "patching doc/Makefile.am for older automake compatibility"
     sed -i.bak 's/^AUTOMAKE_OPTIONS[[:space:]]*=[[:space:]]*info-in-builddir/#&/' doc/Makefile.am
@@ -359,6 +367,7 @@ write_rpm_file_list() {
     local rel="/${path#${install_root}/}"
     case "$rel" in
       /etc/fwknop/fwknopd.conf|/etc/fwknop/access.conf) ;;
+      /usr/share/man/man[0-9]/*.[0-9]) printf '%s*\n' "$rel" >> "$file_list" ;;
       *) printf '%s\n' "$rel" >> "$file_list" ;;
     esac
   done < <(find "$install_root" \( -type f -o -type l \) | sort)
