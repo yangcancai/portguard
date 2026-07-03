@@ -68,18 +68,34 @@ load_os_release() {
   OS_LIKE="${ID_LIKE:-}"
 }
 
-configure_centos7_vault_repos() {
-  if [ "${OS_ID:-}" != "centos" ] || [ "${OS_VERSION_ID%%.*}" != "7" ]; then
+configure_centos_vault_repos() {
+  if [ "${OS_ID:-}" != "centos" ]; then
     return
   fi
 
   [ -d /etc/yum.repos.d ] || return
-  log "configuring CentOS 7 vault repositories"
-  sed -i \
-    -e 's/^mirrorlist=/#mirrorlist=/' \
-    -e 's|^#baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
-    -e 's|^baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
-    /etc/yum.repos.d/CentOS-*.repo
+
+  case "${OS_VERSION_ID%%.*}" in
+    7)
+      log "configuring CentOS 7 vault repositories"
+      sed -i \
+        -e 's/^mirrorlist=/#mirrorlist=/' \
+        -e 's|^#baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
+        -e 's|^baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
+        /etc/yum.repos.d/CentOS-*.repo
+      ;;
+    8)
+      log "configuring CentOS Stream 8 vault repositories"
+      sed -i \
+        -e 's/^mirrorlist=/#mirrorlist=/' \
+        -e 's|^#baseurl=http://mirror.centos.org/$contentdir/$stream|baseurl=http://vault.centos.org/$contentdir/$stream|' \
+        -e 's|^baseurl=http://mirror.centos.org/$contentdir/$stream|baseurl=http://vault.centos.org/$contentdir/$stream|' \
+        /etc/yum.repos.d/CentOS-*.repo
+      ;;
+    *)
+      return
+      ;;
+  esac
 
   if command -v yum >/dev/null 2>&1; then
     yum clean all >/dev/null 2>&1 || true
@@ -112,7 +128,7 @@ install_package() {
       if command -v dnf >/dev/null 2>&1; then
         pm="dnf"
       fi
-      configure_centos7_vault_repos
+      configure_centos_vault_repos
       retry "$pm" install -y ca-certificates iptables
       retry "$pm" install -y qrencode \
         || log "optional qrencode package is unavailable"

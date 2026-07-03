@@ -75,6 +75,16 @@ distro_os_version() {
     centos*)
       printf 'centos\t%s' "${distro#centos}"
       ;;
+    openwrt*)
+      local raw version
+      raw="${distro#openwrt}"
+      version="${raw%%-*}"
+      if [ "${#version}" = "4" ]; then
+        printf 'openwrt\t%s.%s' "${version%??}" "${version#??}"
+      else
+        printf 'openwrt\t%s' "$version"
+      fi
+      ;;
     *)
       printf '%s\t' "$distro"
       ;;
@@ -106,6 +116,15 @@ parse_package() {
       arch="${rest#*.}"
       format="rpm"
       ;;
+    portguard-server_*.ipk)
+      rest="${base#portguard-server_}"
+      rest="${rest%.ipk}"
+      pkg_version="${rest%%_*}"
+      rest="${rest#*_}"
+      distro="${rest%%_*}"
+      arch="${rest#*_}"
+      format="ipk"
+      ;;
     *)
       return 1
       ;;
@@ -133,8 +152,8 @@ main() {
   local tmp_packages
   tmp_packages="$(mktemp)"
 
-  find "$DIST_DIR" -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) | sort > "$tmp_packages"
-  [ -s "$tmp_packages" ] || die "no .deb or .rpm packages found in $DIST_DIR"
+  find "$DIST_DIR" -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.ipk' \) | sort > "$tmp_packages"
+  [ -s "$tmp_packages" ] || die "no .deb, .rpm, or .ipk packages found in $DIST_DIR"
 
   : > "$checksums"
   : > "$tsv"
