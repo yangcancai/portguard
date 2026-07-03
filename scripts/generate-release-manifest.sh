@@ -72,6 +72,9 @@ distro_os_version() {
     rocky*)
       printf 'rocky\t%s' "${distro#rocky}"
       ;;
+    centos*)
+      printf 'centos\t%s' "${distro#centos}"
+      ;;
     *)
       printf '%s\t' "$distro"
       ;;

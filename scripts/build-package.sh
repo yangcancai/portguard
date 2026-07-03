@@ -116,6 +116,24 @@ load_os_release() {
   OS_LIKE="${ID_LIKE:-}"
 }
 
+configure_centos7_vault_repos() {
+  if [ "${OS_ID:-}" != "centos" ] || [ "${OS_VERSION_ID%%.*}" != "7" ]; then
+    return
+  fi
+
+  [ -d /etc/yum.repos.d ] || return
+  log "configuring CentOS 7 vault repositories"
+  sed -i \
+    -e 's/^mirrorlist=/#mirrorlist=/' \
+    -e 's|^#baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
+    -e 's|^baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
+    /etc/yum.repos.d/CentOS-*.repo
+
+  if command -v yum >/dev/null 2>&1; then
+    yum clean all >/dev/null 2>&1 || true
+  fi
+}
+
 os_family() {
   local ids="${OS_ID:-} ${OS_LIKE:-}"
   case "$ids" in
@@ -186,6 +204,8 @@ install_build_deps_rhel() {
   if command -v dnf >/dev/null 2>&1; then
     pm="dnf"
   fi
+
+  configure_centos7_vault_repos
 
   retry "$pm" install -y \
     bash ca-certificates tar gzip findutils sed grep gawk which \

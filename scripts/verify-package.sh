@@ -64,7 +64,26 @@ load_os_release() {
   # shellcheck disable=SC1091
   . /etc/os-release
   OS_ID="${ID:-}"
+  OS_VERSION_ID="${VERSION_ID:-}"
   OS_LIKE="${ID_LIKE:-}"
+}
+
+configure_centos7_vault_repos() {
+  if [ "${OS_ID:-}" != "centos" ] || [ "${OS_VERSION_ID%%.*}" != "7" ]; then
+    return
+  fi
+
+  [ -d /etc/yum.repos.d ] || return
+  log "configuring CentOS 7 vault repositories"
+  sed -i \
+    -e 's/^mirrorlist=/#mirrorlist=/' \
+    -e 's|^#baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
+    -e 's|^baseurl=http://mirror.centos.org/centos/$releasever|baseurl=http://vault.centos.org/7.9.2009|' \
+    /etc/yum.repos.d/CentOS-*.repo
+
+  if command -v yum >/dev/null 2>&1; then
+    yum clean all >/dev/null 2>&1 || true
+  fi
 }
 
 os_family() {
@@ -93,6 +112,7 @@ install_package() {
       if command -v dnf >/dev/null 2>&1; then
         pm="dnf"
       fi
+      configure_centos7_vault_repos
       retry "$pm" install -y ca-certificates iptables
       retry "$pm" install -y qrencode \
         || log "optional qrencode package is unavailable"

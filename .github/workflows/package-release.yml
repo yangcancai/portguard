@@ -32,6 +32,9 @@ jobs:
           - distro: ubuntu2404
             image: ubuntu:24.04
             platform: linux/amd64
+          - distro: centos7
+            image: quay.io/centos/centos:7
+            platform: linux/amd64
           - distro: rocky8
             image: rockylinux:8
             platform: linux/amd64
@@ -118,7 +121,7 @@ jobs:
             gh release create "$GITHUB_REF_NAME" release/* \
               --verify-tag \
               --title "PortGuard Server ${GITHUB_REF_NAME}" \
-              --notes "Automated PortGuard Server packages for Debian, Ubuntu, and Rocky Linux."
+              --notes "Automated PortGuard Server packages for Debian, Ubuntu, CentOS, and Rocky Linux."
           fi
         env:
           GH_TOKEN: ${{ github.token }}
