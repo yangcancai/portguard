@@ -595,11 +595,70 @@ static int restart_fwknopd(fko_srv_options_t * const opts)
 #if defined(_MSC_VER) && _MSC_VER < 1900
 #define snprintf _snprintf
 #endif
+
+static void
+sanitize_qr_value(char *value, const size_t value_len,
+        const char *fallback, const int allow_addr_chars)
+{
+    size_t i;
+
+    if(value == NULL || value_len == 0)
+        return;
+
+    if(value[0] == '\0' && fallback != NULL)
+        strlcpy(value, fallback, value_len);
+
+    for(i = 0; value[i] != '\0'; i++)
+    {
+        if(isalnum((unsigned char)value[i]) != 0
+                || value[i] == '.'
+                || value[i] == '_'
+                || value[i] == '-'
+                || (allow_addr_chars && (value[i] == ':'
+                    || value[i] == '[' || value[i] == ']')))
+        {
+            continue;
+        }
+        value[i] = '-';
+    }
+}
+
 static int qr_fwknopd(fko_srv_options_t * const opts)
 {
     char qr_code[2048];
+    char hostname[256];
+    char section_base[320];
+    char section_name[320];
+    char client_server[512];
+    char allow_ip[512];
+    char cmd[2300];
     int c = 0;
     unsigned char enable_udp_server = 0;
+    int qrencode_available;
+
+    memset(hostname, 0x0, sizeof(hostname));
+    if(gethostname(hostname, sizeof(hostname)-1) != 0 || hostname[0] == '\0')
+        strlcpy(hostname, "portguard", sizeof(hostname));
+    sanitize_qr_value(hostname, sizeof(hostname), "portguard", 0);
+
+    memset(section_base, 0x0, sizeof(section_base));
+    if(opts->config[CONF_PORTGUARD_SECTION_NAME] != NULL)
+        strlcpy(section_base, opts->config[CONF_PORTGUARD_SECTION_NAME],
+                sizeof(section_base));
+    sanitize_qr_value(section_base, sizeof(section_base), hostname, 0);
+
+    memset(client_server, 0x0, sizeof(client_server));
+    if(opts->config[CONF_PORTGUARD_CLIENT_SERVER] != NULL)
+        strlcpy(client_server, opts->config[CONF_PORTGUARD_CLIENT_SERVER],
+                sizeof(client_server));
+    sanitize_qr_value(client_server, sizeof(client_server), "", 1);
+
+    memset(allow_ip, 0x0, sizeof(allow_ip));
+    if(opts->config[CONF_PORTGUARD_ALLOW_IP] != NULL)
+        strlcpy(allow_ip, opts->config[CONF_PORTGUARD_ALLOW_IP],
+                sizeof(allow_ip));
+    sanitize_qr_value(allow_ip, sizeof(allow_ip), "resolve", 1);
+
     if(opts->enable_udp_server ||
         strncasecmp(opts->config[CONF_ENABLE_UDP_SERVER], "Y", 1) == 0)
         {
@@ -608,29 +667,39 @@ static int qr_fwknopd(fko_srv_options_t * const opts)
     unsigned short port = enable_udp_server ? opts->udpserv_port : opts->tcpserv_port;
     const char *proto = enable_udp_server ? "udp" : "tcp";
     acc_stanza_t *cur = opts->acc_stanzas;
+    qrencode_available = system("command -v qrencode >/dev/null 2>&1") == 0;
+
     while (cur != NULL) {
     const char *key = cur->key_base64 ? cur->key_base64 : "";
     const char *hmac = cur->hmac_key_base64 ? cur->hmac_key_base64 : "";
     const char *user = cur->require_username ? cur->require_username : "";
     const char *access = cur->open_ports ? cur->open_ports : "";
-    snprintf(qr_code, sizeof(qr_code), "SPA_SERVER_PROTO:%s SPA_SERVER_PORT:%d ALLOW_IP:resolve ACCESS:%s SPA_SERVER:%s KEY_BASE64:%s HMAC_KEY_BASE64:%s USE_HMAC:Y SPOOF_USER:%s FW_TIMEOUT:60",
-     proto, port, access, "", key, hmac, user);
+    int timeout = cur->fw_access_timeout > 0
+            ? cur->fw_access_timeout : DEF_FW_ACCESS_TIMEOUT;
      c++;
-    // qrencode -t ANSI qr_code 
+    if(c == 1)
+        strlcpy(section_name, section_base, sizeof(section_name));
+    else
+        snprintf(section_name, sizeof(section_name), "%s-%d", section_base, c);
+    snprintf(qr_code, sizeof(qr_code), "SECTION_NAME:%s SPA_SERVER_PROTO:%s SPA_SERVER_PORT:%d ALLOW_IP:%s ACCESS:%s SPA_SERVER:%s KEY_BASE64:%s HMAC_KEY_BASE64:%s USE_HMAC:Y SPOOF_USER:%s FW_TIMEOUT:%d",
+     section_name, proto, port, allow_ip, access, client_server, key, hmac, user, timeout);
     fprintf(stdout, "%s\n", qr_code);
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "qrencode -t UTF8 -s 1 \"%s\"", qr_code);
-   // Execute the command 
-    int ret = system(cmd);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to execute qrencode command.\n");
-        return EXIT_FAILURE;
+    fflush(stdout);
+    if(qrencode_available) {
+        snprintf(cmd, sizeof(cmd), "qrencode -t UTF8 -s 1 \"%s\"", qr_code);
+        if (system(cmd) != 0) {
+            fprintf(stderr, "Failed to execute qrencode command.\n");
+            return EXIT_FAILURE;
+        }
     }
     cur = cur->next;
    }
    if (c == 0) {
         fprintf(stderr, "No access stanzas found.\n");
-    }
+        return EXIT_FAILURE;
+   }
+   if(!qrencode_available)
+        fprintf(stderr, "qrencode is not installed; raw client payload printed above.\n");
     return EXIT_SUCCESS;
 }
 static int fw_console(fko_srv_options_t * const opts)

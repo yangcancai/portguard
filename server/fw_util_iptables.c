@@ -1935,12 +1935,17 @@ validate_ipt_chain_conf(const char * const chain_str)
 #define TEMP_RULES_FILE "/tmp/iptables_temp.rules"
 #define BACKUP_RULES_FILE "/tmp/iptables_backup.rules"
 
-void execute_cmd(const char *cmd) {
+int execute_cmd_status(const char *cmd) {
     printf("Executing: %s\n", cmd);
     int status = system(cmd);
     if (status != 0) {
         printf("Command failed with status %d\n", status);
     }
+    return status;
+}
+
+void execute_cmd(const char *cmd) {
+    (void) execute_cmd_status(cmd);
 }
 
 void list_rules() {
@@ -1959,6 +1964,53 @@ int validate_rules_file(const char *filename) {
     char cmd[MAX_CMD_LEN];
     snprintf(cmd, MAX_CMD_LEN, "iptables-restore -n < %s", filename);
     return system(cmd) == 0;
+}
+
+static int file_exists(const char *path) {
+    return access(path, F_OK) == 0;
+}
+
+static int command_exists(const char *cmd) {
+    char check_cmd[MAX_CMD_LEN];
+    snprintf(check_cmd, sizeof(check_cmd),
+            "command -v %s >/dev/null 2>&1", cmd);
+    return system(check_cmd) == 0;
+}
+
+static int save_rules_to_path(const char *dir, const char *path) {
+    char cmd[MAX_CMD_LEN];
+
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir);
+    if (execute_cmd_status(cmd) != 0)
+        return -1;
+
+    snprintf(cmd, sizeof(cmd), "iptables-save > %s", path);
+    return execute_cmd_status(cmd) == 0 ? 0 : -1;
+}
+
+static int save_runtime_persistent_rules(void) {
+    int saved = -1;
+
+    if (file_exists("/etc/debian_version") || file_exists("/etc/lsb-release")) {
+        saved = save_rules_to_path("/etc/iptables", "/etc/iptables/rules.v4");
+        if (saved == 0 && command_exists("netfilter-persistent"))
+            execute_cmd("netfilter-persistent save");
+        else if (saved == 0)
+            printf("Note: install netfilter-persistent or iptables-persistent to restore rules after reboot.\n");
+        return saved;
+    }
+
+    if (file_exists("/etc/redhat-release")) {
+        return save_rules_to_path("/etc/sysconfig", "/etc/sysconfig/iptables");
+    }
+
+    if (file_exists("/etc/iptables")) {
+        saved = save_rules_to_path("/etc/iptables", "/etc/iptables/rules.v4");
+        if (saved == 0)
+            return 0;
+    }
+
+    return save_rules_to_path("/etc/sysconfig", "/etc/sysconfig/iptables");
 }
 
 int initialize_firewall(fko_srv_options_t * const opts) {
@@ -2097,11 +2149,10 @@ int initialize_firewall(fko_srv_options_t * const opts) {
     }
     
     // Save to permanent configuration
-    #if defined(__DEBIAN__) || defined(__UBUNTU__)
-        execute_cmd("iptables-save > /etc/iptables/rules.v4");
-    #else
-        execute_cmd("iptables-save > /etc/sysconfig/iptables");
-    #endif
+    if (save_runtime_persistent_rules() != 0) {
+        printf("Warning: failed to save persistent firewall rules.\n");
+        printf("The active rules were applied, but they may not survive reboot.\n");
+    }
     
     printf("\nFirewall initialized successfully.\n");
     list_rules();
@@ -2111,11 +2162,10 @@ int initialize_firewall(fko_srv_options_t * const opts) {
 
 void save_persistent_rules() {
     printf("Saving rules to persistent configuration...\n");
-#if defined(__DEBIAN__) || defined(__UBUNTU__)
-    execute_cmd("iptables-save > /etc/iptables/rules.v4");
-#else
-    execute_cmd("iptables-save > /etc/sysconfig/iptables");
-#endif
+    if (save_runtime_persistent_rules() != 0) {
+        printf("Warning: failed to save persistent firewall rules.\n");
+        printf("The active rules were applied, but they may not survive reboot.\n");
+    }
 }
 void add_port_rule() {
     char protocol[4];

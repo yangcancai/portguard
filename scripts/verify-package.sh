@@ -4,6 +4,9 @@ set -Eeuo pipefail
 PACKAGE_FILE=""
 VERIFY_ACCESS="${VERIFY_ACCESS:-tcp/22,tcp/443}"
 VERIFY_KNOCK_PORT="${VERIFY_KNOCK_PORT:-62201}"
+VERIFY_SERVER_HOST="${VERIFY_SERVER_HOST:-verify.example.test}"
+VERIFY_SECTION_NAME="${VERIFY_SECTION_NAME:-verify-server}"
+VERIFY_ALLOW_IP="${VERIFY_ALLOW_IP:-resolve}"
 VERIFY_USER="${VERIFY_USER:-verify-user}"
 VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
 
@@ -180,6 +183,9 @@ ACCESS_FILE                 access.conf;
 FIREWALL_EXE                ${firewall_exe};
 SYSLOG_IDENTITY             fwknopd;
 SYSLOG_FACILITY             LOG_DAEMON;
+PORTGUARD_CLIENT_SERVER     ${VERIFY_SERVER_HOST};
+PORTGUARD_SECTION_NAME      ${VERIFY_SECTION_NAME};
+PORTGUARD_ALLOW_IP          ${VERIFY_ALLOW_IP};
 EOF
 
   cat > /etc/fwknop/access.conf <<EOF
@@ -231,8 +237,13 @@ verify_fwknopd() {
       --qr \
       -c /etc/fwknop/fwknopd.conf \
       -a /etc/fwknop/access.conf > /tmp/fwknopd-qr.out
+    grep -q 'SECTION_NAME:' /tmp/fwknopd-qr.out || fail "fwknopd --qr output is missing SECTION_NAME"
+    grep -q "SECTION_NAME:${VERIFY_SECTION_NAME}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected SECTION_NAME"
+    grep -q "SPA_SERVER:${VERIFY_SERVER_HOST}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected SPA_SERVER"
+    grep -q "ALLOW_IP:${VERIFY_ALLOW_IP}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected ALLOW_IP"
     grep -q 'KEY_BASE64:' /tmp/fwknopd-qr.out || fail "fwknopd --qr output is missing KEY_BASE64"
     grep -q 'HMAC_KEY_BASE64:' /tmp/fwknopd-qr.out || fail "fwknopd --qr output is missing HMAC_KEY_BASE64"
+    grep -q "FW_TIMEOUT:${VERIFY_TIMEOUT}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected FW_TIMEOUT"
   else
     log "qrencode is unavailable; skipping fwknopd --qr check"
   fi
@@ -243,6 +254,41 @@ verify_fwknopd() {
   fi
 }
 
+verify_fw_console_persistence() {
+  local family="$1"
+
+  case "$family" in
+    debian)
+      log "checking fwknopd --fw-console persists rules to Debian path"
+      rm -rf /etc/iptables /etc/sysconfig
+      mkdir -p /etc/fwknop /run/fwknop
+      printf '3\ntcp\n65535\ny\n0\n' | timeout 10 fwknopd \
+        --fw-console \
+        -c /etc/fwknop/fwknopd.conf \
+        -a /etc/fwknop/access.conf > /tmp/fwknopd-fw-console.out
+      grep -q 'Executing: iptables-save > /etc/iptables/rules.v4' /tmp/fwknopd-fw-console.out \
+        || fail "fwknopd --fw-console did not save to /etc/iptables/rules.v4 on Debian"
+      [ -f /etc/iptables/rules.v4 ] \
+        || fail "fwknopd --fw-console did not create /etc/iptables/rules.v4"
+      [ ! -e /etc/sysconfig/iptables ] \
+        || fail "fwknopd --fw-console unexpectedly wrote /etc/sysconfig/iptables on Debian"
+      ;;
+    rhel)
+      log "checking fwknopd --fw-console persists rules to RHEL path"
+      rm -rf /etc/sysconfig
+      mkdir -p /etc/fwknop /run/fwknop
+      printf '3\ntcp\n65535\ny\n0\n' | timeout 10 fwknopd \
+        --fw-console \
+        -c /etc/fwknop/fwknopd.conf \
+        -a /etc/fwknop/access.conf > /tmp/fwknopd-fw-console.out
+      grep -q 'Executing: iptables-save > /etc/sysconfig/iptables' /tmp/fwknopd-fw-console.out \
+        || fail "fwknopd --fw-console did not save to /etc/sysconfig/iptables on RHEL"
+      [ -f /etc/sysconfig/iptables ] \
+        || fail "fwknopd --fw-console did not create /etc/sysconfig/iptables"
+      ;;
+  esac
+}
+
 main() {
   parse_args "$@"
   [ -n "$PACKAGE_FILE" ] || fail "--package is required"
@@ -250,9 +296,11 @@ main() {
   load_os_release
 
   log "installing ${PACKAGE_FILE} in ${OS_ID}"
-  install_package "$(os_family)"
+  family="$(os_family)"
+  install_package "$family"
   verify_installed_files
   verify_fwknopd
+  verify_fw_console_persistence "$family"
   log "PASS ${PACKAGE_FILE}"
 }
 
