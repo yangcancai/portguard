@@ -276,6 +276,13 @@ write_non_input_filter_rules() {
   ' "$source" > "$output"
 }
 
+files_equal() {
+  local left="$1"
+  local right="$2"
+
+  [ "$(cksum < "$left")" = "$(cksum < "$right")" ]
+}
+
 verify_fw_console_input_merge() {
   local backup prepared after before_non_input after_non_input out chain
 
@@ -312,7 +319,7 @@ verify_fw_console_input_merge() {
 
     write_non_input_filter_rules "$prepared" "$before_non_input"
     write_non_input_filter_rules "$after" "$after_non_input"
-    cmp -s "$before_non_input" "$after_non_input" \
+    files_equal "$before_non_input" "$after_non_input" \
       || fail "fw-console initialize changed non-INPUT filter rules"
 
     grep -Eq "^-A INPUT -p tcp( -m tcp)? --dport 2222 -j ACCEPT$" "$after" \
