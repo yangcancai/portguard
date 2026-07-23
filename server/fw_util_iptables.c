@@ -1932,8 +1932,282 @@ validate_ipt_chain_conf(const char * const chain_str)
 
 #define MAX_CMD_LEN 256
 #define MAX_PORTS 20
+#define MAX_RULE_LINE 4096
 #define TEMP_RULES_FILE "/tmp/iptables_temp.rules"
 #define BACKUP_RULES_FILE "/tmp/iptables_backup.rules"
+
+typedef struct input_rule_list {
+    char *rule;
+    struct input_rule_list *next;
+} input_rule_list_t;
+
+static void free_rule_list(input_rule_list_t *rules) {
+    input_rule_list_t *next;
+
+    while (rules != NULL) {
+        next = rules->next;
+        free(rules->rule);
+        free(rules);
+        rules = next;
+    }
+}
+
+static int append_rule(input_rule_list_t **head, input_rule_list_t **tail,
+        const char *rule) {
+    input_rule_list_t *node = calloc(1, sizeof(*node));
+
+    if (node == NULL)
+        return -1;
+
+    node->rule = strdup(rule);
+    if (node->rule == NULL) {
+        free(node);
+        return -1;
+    }
+
+    if (*tail != NULL)
+        (*tail)->next = node;
+    else
+        *head = node;
+
+    *tail = node;
+    return 0;
+}
+
+static int rule_list_contains_exact(const input_rule_list_t *rules,
+        const char *rule) {
+    while (rules != NULL) {
+        if (strcmp(rules->rule, rule) == 0)
+            return 1;
+        rules = rules->next;
+    }
+
+    return 0;
+}
+
+static int append_unique_rule(input_rule_list_t **head, input_rule_list_t **tail,
+        const char *rule) {
+    if (rule_list_contains_exact(*head, rule))
+        return 0;
+
+    return append_rule(head, tail, rule);
+}
+
+static int line_contains_token(const char *line, const char *token) {
+    const char *ndx = line;
+    const size_t token_len = strlen(token);
+
+    while ((ndx = strstr(ndx, token)) != NULL) {
+        const int before_ok = (ndx == line)
+            || isspace((unsigned char) *(ndx - 1));
+        const char after = *(ndx + token_len);
+        const int after_ok = after == '\0'
+            || isspace((unsigned char) after)
+            || after == ',';
+
+        if (before_ok && after_ok)
+            return 1;
+
+        ndx++;
+    }
+
+    return 0;
+}
+
+static int rule_list_contains_port_accept(const input_rule_list_t *rules,
+        const char *proto, const char *port) {
+    char proto_token[16];
+    char port_token[32];
+
+    snprintf(proto_token, sizeof(proto_token), "-p %s", proto);
+    snprintf(port_token, sizeof(port_token), "--dport %s", port);
+
+    while (rules != NULL) {
+        if (strncmp(rules->rule, "-A INPUT ", 9) == 0
+                && line_contains_token(rules->rule, proto_token)
+                && line_contains_token(rules->rule, port_token)
+                && line_contains_token(rules->rule, "-j ACCEPT"))
+            return 1;
+
+        rules = rules->next;
+    }
+
+    return 0;
+}
+
+static void strip_line_end(char *line) {
+    line[strcspn(line, "\r\n")] = '\0';
+}
+
+static int line_was_truncated(const char *line, FILE *fp) {
+    const size_t len = strlen(line);
+
+    return len > 0 && line[len - 1] != '\n' && !feof(fp);
+}
+
+static int emit_merged_input_rules(FILE *temp_rules,
+        const input_rule_list_t *existing_input_rules,
+        char ports[MAX_PORTS][16],
+        char protocols[MAX_PORTS][4],
+        int port_count) {
+    input_rule_list_t *merged_rules = NULL;
+    input_rule_list_t *merged_tail = NULL;
+    input_rule_list_t *rule = NULL;
+    const input_rule_list_t *existing_rule = NULL;
+    char port_rule[128];
+    int i;
+    int rv = -1;
+
+    if (append_unique_rule(&merged_rules, &merged_tail,
+                "-A INPUT -i lo -j ACCEPT") != 0)
+        goto cleanup;
+    if (append_unique_rule(&merged_rules, &merged_tail,
+                "-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT") != 0)
+        goto cleanup;
+    if (append_unique_rule(&merged_rules, &merged_tail,
+                "-A INPUT -p icmp -j ACCEPT") != 0)
+        goto cleanup;
+
+    for (i = 0; i < port_count; i++) {
+        if (rule_list_contains_port_accept(merged_rules, protocols[i], ports[i]))
+            continue;
+
+        snprintf(port_rule, sizeof(port_rule),
+                "-A INPUT -p %s --dport %s -j ACCEPT",
+                protocols[i], ports[i]);
+
+        if (append_unique_rule(&merged_rules, &merged_tail, port_rule) != 0)
+            goto cleanup;
+    }
+
+    for (existing_rule = existing_input_rules;
+            existing_rule != NULL;
+            existing_rule = existing_rule->next) {
+        if (append_unique_rule(&merged_rules, &merged_tail,
+                    existing_rule->rule) != 0)
+            goto cleanup;
+    }
+
+    for (rule = merged_rules; rule != NULL; rule = rule->next)
+        fprintf(temp_rules, "%s\n", rule->rule);
+
+    rv = 0;
+
+cleanup:
+    free_rule_list(merged_rules);
+    return rv;
+}
+
+static int build_input_only_rules_file(const char *source_path,
+        const char *dest_path,
+        char ports[MAX_PORTS][16],
+        char protocols[MAX_PORTS][4],
+        int port_count) {
+    FILE *current_rules = NULL;
+    FILE *temp_rules = NULL;
+    input_rule_list_t *existing_input_rules = NULL;
+    input_rule_list_t *existing_tail = NULL;
+    char line[MAX_RULE_LINE];
+    int in_filter = 0;
+    int saw_filter = 0;
+    int saw_input_chain = 0;
+    int rv = -1;
+
+    current_rules = fopen(source_path, "r");
+    if (current_rules == NULL) {
+        perror("Failed to read current iptables rules");
+        return -1;
+    }
+
+    temp_rules = fopen(dest_path, "w");
+    if (temp_rules == NULL) {
+        perror("Failed to create temporary rules file");
+        fclose(current_rules);
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), current_rules) != NULL) {
+        if (line_was_truncated(line, current_rules)) {
+            printf("iptables-save output contains a rule longer than %d bytes.\n",
+                    MAX_RULE_LINE - 1);
+            goto cleanup;
+        }
+
+        strip_line_end(line);
+
+        if (strcmp(line, "*filter") == 0) {
+            in_filter = 1;
+            saw_filter = 1;
+            saw_input_chain = 0;
+            fprintf(temp_rules, "%s\n", line);
+            continue;
+        }
+
+        if (in_filter && strcmp(line, "COMMIT") == 0) {
+            if (!saw_input_chain)
+                fprintf(temp_rules, ":INPUT DROP [0:0]\n");
+
+            if (emit_merged_input_rules(temp_rules, existing_input_rules,
+                        ports, protocols, port_count) != 0) {
+                printf("Failed to merge INPUT chain rules.\n");
+                goto cleanup;
+            }
+
+            fprintf(temp_rules, "COMMIT\n");
+            in_filter = 0;
+            continue;
+        }
+
+        if (in_filter && strncmp(line, ":INPUT ", 7) == 0) {
+            saw_input_chain = 1;
+            fprintf(temp_rules, ":INPUT DROP [0:0]\n");
+            continue;
+        }
+
+        if (in_filter && strncmp(line, "-A INPUT ", 9) == 0) {
+            if (append_rule(&existing_input_rules, &existing_tail, line) != 0) {
+                printf("Failed to collect existing INPUT chain rule.\n");
+                goto cleanup;
+            }
+            continue;
+        }
+
+        fprintf(temp_rules, "%s\n", line);
+    }
+
+    if (ferror(current_rules)) {
+        perror("Failed while reading current iptables rules");
+        goto cleanup;
+    }
+
+    if (in_filter) {
+        printf("Invalid iptables-save output: missing COMMIT for filter table.\n");
+        goto cleanup;
+    }
+
+    if (!saw_filter) {
+        fprintf(temp_rules, "*filter\n");
+        fprintf(temp_rules, ":INPUT DROP [0:0]\n");
+        if (emit_merged_input_rules(temp_rules, existing_input_rules,
+                    ports, protocols, port_count) != 0) {
+            printf("Failed to merge INPUT chain rules.\n");
+            goto cleanup;
+        }
+        fprintf(temp_rules, "COMMIT\n");
+    }
+
+    rv = 0;
+
+cleanup:
+    free_rule_list(existing_input_rules);
+    fclose(current_rules);
+    fclose(temp_rules);
+
+    if (rv != 0)
+        remove(dest_path);
+
+    return rv;
+}
 
 int execute_cmd_status(const char *cmd) {
     printf("Executing: %s\n", cmd);
@@ -2018,11 +2292,12 @@ int initialize_firewall(fko_srv_options_t * const opts) {
     char protocols[MAX_PORTS][4];
     int port_count = 0;
     char choice;
-    FILE *temp_rules = NULL;
     unsigned int enable_udp_server = 0; 
     printf("\nFirewall Initialization\n");
     printf("======================\n");
-    printf("WARNING: This will reset ALL firewall rules!\n");
+    printf("This will update only the INPUT chain.\n");
+    printf("Other chains and tables will be preserved.\n");
+    printf("Existing INPUT rules will be merged after PortGuard allow rules.\n");
     printf("Recommended: Have physical console access or\n");
     printf("a secondary SSH session open as backup.\n");
     printf("Continue? (y/n): ");
@@ -2048,7 +2323,7 @@ int initialize_firewall(fko_srv_options_t * const opts) {
     scanf(" %c", &choice);
     while(getchar() != '\n'); 
     if (choice == 'y' || choice == 'Y') {
-        printf("\The %s port %d listened to by fwknop will be added to the firewall rules.\n",protocols[0], port);
+        printf("\nThe %s port %d listened to by fwknop will be added to the firewall rules.\n",protocols[0], port);
         printf("\nEnter ports to open (protocol port, e.g., 'tcp 22' or 'udp 53')\n");
         printf("Enter 'done' when finished (max %d ports):\n", MAX_PORTS);
         
@@ -2093,33 +2368,18 @@ int initialize_firewall(fko_srv_options_t * const opts) {
             port_count++;
         }
     }
-    
-    // Create temporary rules file
-    temp_rules = fopen(TEMP_RULES_FILE, "w");
-    if (!temp_rules) {
-        perror("Failed to create temporary rules file");
+
+    // Backup current rules and build a restore file that only changes INPUT.
+    if (execute_cmd_status("iptables-save > " BACKUP_RULES_FILE) != 0) {
+        printf("Failed to back up current firewall rules. Aborting.\n");
         return -1;
     }
-    
-    // Write the new rules
-    fprintf(temp_rules, "*filter\n");
-    fprintf(temp_rules, ":INPUT DROP [0:0]\n");
-    fprintf(temp_rules, ":FORWARD DROP [0:0]\n");
-    fprintf(temp_rules, ":OUTPUT ACCEPT [0:0]\n");
-    
-    // Critical rules to maintain connectivity
-    fprintf(temp_rules, "-A INPUT -i lo -j ACCEPT\n");
-    fprintf(temp_rules, "-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
-    fprintf(temp_rules, "-A INPUT -p icmp -j ACCEPT\n");
-   int i; 
-    // Add custom ports
-    for (i = 0; i < port_count; i++) {
-        fprintf(temp_rules, "-A INPUT -p %s --dport %s -j ACCEPT\n", 
-               protocols[i], ports[i]);
+
+    if (build_input_only_rules_file(BACKUP_RULES_FILE, TEMP_RULES_FILE,
+                ports, protocols, port_count) != 0) {
+        printf("Failed to prepare merged INPUT chain rules. Aborting.\n");
+        return -1;
     }
-    
-    fprintf(temp_rules, "COMMIT\n");
-    fclose(temp_rules);
     
     // Validate the rules before applying
     if (!validate_rules_file(TEMP_RULES_FILE)) {
@@ -2127,10 +2387,7 @@ int initialize_firewall(fko_srv_options_t * const opts) {
         remove(TEMP_RULES_FILE);
         return -1;
     }
-    
-    // Backup current rules
-    execute_cmd("iptables-save > " BACKUP_RULES_FILE);
-    
+
     // Set timeout in case the restore hangs
     alarm(60); // 1 minute timeout
     signal(SIGALRM, timeout_handler);
@@ -2154,7 +2411,7 @@ int initialize_firewall(fko_srv_options_t * const opts) {
         printf("The active rules were applied, but they may not survive reboot.\n");
     }
     
-    printf("\nFirewall initialized successfully.\n");
+    printf("\nFirewall INPUT chain initialized successfully.\n");
     list_rules();
     remove(TEMP_RULES_FILE);
     return 0;
@@ -2282,7 +2539,7 @@ void delete_rule() {
 void show_menu() {
     printf("\nFirewall Port Manager\n");
     printf("====================\n");
-    printf("1. Initialize firewall (WARNING: Clears existing rules)\n");
+    printf("1. Initialize INPUT chain (preserve other chains)\n");
     printf("2. List current rules\n");
     printf("3. Add port rule\n");
     printf("4. Delete rule\n");
