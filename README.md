@@ -1,4 +1,46 @@
-# fwknop - Single Packet Authorization
+# PortGuard Server - Single Packet Authorization
+
+PortGuard Server is the server-side component of the PortGuard project.
+The official website is [https://portguard.net](https://portguard.net).
+
+This repository is forked from the original `fwknop` project and modified for
+PortGuard. It keeps the core Single Packet Authorization (SPA) foundation from
+fwknop while adding PortGuard-focused server packaging, release automation,
+installer workflows, service management improvements, firewall initialization
+behavior, and client configuration export support.
+
+The upstream fwknop project remains the original source of the SPA
+implementation and documentation lineage referenced throughout this README.
+
+## PortGuard Additions
+
+This fork adds the following PortGuard-specific capabilities on top of the
+upstream fwknop foundation:
+
+ * Official PortGuard install entrypoint:
+   `curl -fsSL https://portguard.net/install.sh | sudo bash`.
+ * GitHub Actions package release automation for Linux server packages.
+ * Prebuilt `.deb`, `.rpm`, and `.ipk` package generation for Debian, Ubuntu,
+   CentOS, Rocky Linux, and OpenWrt targets.
+ * Release manifest generation (`manifest.tsv`, `manifest.json`, and
+   checksums) so installers can select the correct package for the detected
+   operating system, version, architecture, and package format.
+ * Docker/package verification scripts for CI and local validation of
+   installation, dynamic library dependencies, configuration parsing, QR/client
+   export output, persistent firewall rules, and firewall console behavior.
+ * PortGuard client export support via `fwknopd -Q` / `fwknopd --qr`, including
+   `SECTION_NAME`, server host, SPA protocol/port, allowed IP mode, access
+   ports, generated keys, HMAC settings, username, and timeout values.
+ * PortGuard-specific server configuration options:
+   `PORTGUARD_CLIENT_SERVER`, `PORTGUARD_SECTION_NAME`, and
+   `PORTGUARD_ALLOW_IP`.
+ * A firewall console mode (`fwknopd --fw-console`) for listing rules, adding
+   port rules, deleting rules, persisting rules on Debian/RHEL-family systems,
+   and initializing the `INPUT` chain while preserving other chains and merging
+   existing `INPUT` rules.
+ * Systemd-ready server packaging that installs `fwknopd` and `libfko` together
+   as the PortGuard Server package.
+ * OpenWrt SDK-based package builds for router deployments.
 
 ## Introduction
 fwknop implements an authorization scheme known as Single Packet Authorization
