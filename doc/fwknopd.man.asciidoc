@@ -514,7 +514,13 @@ directive starts a new stanza.
     opened if a valid knock sequence is seen. If this entry is not set,
     *fwknopd* will attempt to honor any proto/port request specified in the
     SPA data (unless of it matches any ``RESTRICT_PORTS'' entries). Multiple
-    entries are comma-separated.
+    entries are comma-separated. Setting this value explicitly to ``ANY'' also
+    authorizes the special SPA request ``ACCESS ANY'', which temporarily allows
+    the requested source IP to access all protocols and ports. ``ACCESS ANY'' is
+    rejected when ``RESTRICT_PORTS'' is configured and is not supported for NAT
+    or command-cycle requests. Leaving ``OPEN_PORTS'' unset still permits
+    arbitrary individual proto/port requests, but does not authorize
+    ``ACCESS ANY''.
 
 *RESTRICT_PORTS* '<proto/port>,...,<proto/port>'::
     Define a set of ports and protocols (tcp or udp) that are explicitly

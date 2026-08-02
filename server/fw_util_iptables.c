@@ -1477,12 +1477,13 @@ int
 process_spa_request(const fko_srv_options_t * const opts,
         const acc_stanza_t * const acc, spa_data_t * const spadat)
 {
+    char            rule_buf[CMD_BUFSIZE] = {0};
     char            nat_ip[MAX_IPV4_STR_LEN] = {0};
     char            nat_dst[MAX_HOSTNAME_LEN] = {0};
 
     unsigned int    nat_port = 0;
-    unsigned int    fst_proto;
-    unsigned int    fst_port;
+    unsigned int    fst_proto = ANY_PROTO;
+    unsigned int    fst_port = ANY_PORT;
 
     struct fw_chain * const in_chain   = &(opts->fw_config->chain[IPT_INPUT_ACCESS]);
     struct fw_chain * const out_chain  = &(opts->fw_config->chain[IPT_OUTPUT_ACCESS]);
@@ -1494,13 +1495,22 @@ process_spa_request(const fko_srv_options_t * const opts,
 
     char            *ndx = NULL;
     int             res = 0, is_err;
+    int             access_any = strcmp(spadat->spa_message_remain, "ANY") == 0;
     int             str_len;
     time_t          now;
     unsigned int    exp_ts;
 
+    if(access_any && (acc->force_nat
+            || spadat->message_type == FKO_LOCAL_NAT_ACCESS_MSG
+            || spadat->message_type == FKO_CLIENT_TIMEOUT_LOCAL_NAT_ACCESS_MSG
+            || spadat->message_type == FKO_NAT_ACCESS_MSG
+            || spadat->message_type == FKO_CLIENT_TIMEOUT_NAT_ACCESS_MSG))
+        return res;
+
     /* Parse and expand our access message.
     */
-    if(expand_acc_port_list(&port_list, spadat->spa_message_remain) != 1)
+    if(!access_any
+            && expand_acc_port_list(&port_list, spadat->spa_message_remain) != 1)
     {
         /* technically we would already have exited with an error if there were
          * any memory allocation errors (see the add_port_list() function), but
@@ -1517,8 +1527,11 @@ process_spa_request(const fko_srv_options_t * const opts,
     /* Remember the first proto/port combo in case we need them
      * for NAT access requests.
     */
-    fst_proto = ple->proto;
-    fst_port  = ple->port;
+    if(!access_any)
+    {
+        fst_proto = ple->proto;
+        fst_port  = ple->port;
+    }
 
     /* Set our expire time value.
     */
@@ -1627,6 +1640,36 @@ process_spa_request(const fko_srv_options_t * const opts,
     }
     else /* Non-NAT request - this is the typical case. */
     {
+        if(access_any)
+        {
+            snprintf(rule_buf, CMD_BUFSIZE-1, IPT_ANY_ACCESS_RULE_ARGS,
+                in_chain->table,
+                spadat->use_src_ip,
+                (fwc.use_destination ? spadat->pkt_destination_ip : IPT_ANY_IP),
+                exp_ts,
+                in_chain->target
+            );
+            ipt_rule(opts, rule_buf, NULL, spadat->use_src_ip,
+                (fwc.use_destination ? spadat->pkt_destination_ip : IPT_ANY_IP),
+                ANY_PROTO, ANY_PORT, NULL, NAT_ANY_PORT,
+                in_chain, exp_ts, now, "access", spadat->spa_message_remain);
+
+            if(strlen(out_chain->to_chain))
+            {
+                snprintf(rule_buf, CMD_BUFSIZE-1, IPT_OUT_ANY_ACCESS_RULE_ARGS,
+                    out_chain->table,
+                    spadat->use_src_ip,
+                    (fwc.use_destination ? spadat->pkt_destination_ip : IPT_ANY_IP),
+                    exp_ts,
+                    out_chain->target
+                );
+                ipt_rule(opts, rule_buf, NULL, spadat->use_src_ip,
+                    (fwc.use_destination ? spadat->pkt_destination_ip : IPT_ANY_IP),
+                    ANY_PROTO, ANY_PORT, NULL, NAT_ANY_PORT,
+                    out_chain, exp_ts, now, "OUTPUT", spadat->spa_message_remain);
+            }
+        }
+
         /* Create an access command for each proto/port for the source ip.
         */
         while(ple != NULL)
@@ -2035,6 +2078,140 @@ static int rule_list_contains_port_accept(const input_rule_list_t *rules,
     return 0;
 }
 
+static int chain_definition_matches(const char *line, const char *chain) {
+    size_t chain_len;
+
+    if (chain == NULL || chain[0] == '\0' || line[0] != ':')
+        return 0;
+
+    chain_len = strlen(chain);
+
+    return strncmp(line + 1, chain, chain_len) == 0
+        && line[chain_len + 1] == ' ';
+}
+
+static int valid_port_string(const char *port) {
+    char *endptr = NULL;
+    long port_num;
+
+    if (port == NULL || port[0] == '\0')
+        return 0;
+
+    port_num = strtol(port, &endptr, 10);
+    return *endptr == '\0' && port_num >= 1 && port_num <= 65535;
+}
+
+static int port_entry_exists(char ports[MAX_PORTS][16],
+        char protocols[MAX_PORTS][4],
+        int port_count,
+        const char *proto,
+        const char *port) {
+    int i;
+
+    for (i = 0; i < port_count; i++) {
+        if (strcmp(protocols[i], proto) == 0 && strcmp(ports[i], port) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int add_port_entry(char ports[MAX_PORTS][16],
+        char protocols[MAX_PORTS][4],
+        int *port_count,
+        const char *proto,
+        const char *port) {
+    if (strcmp(proto, "tcp") != 0 && strcmp(proto, "udp") != 0)
+        return -1;
+
+    if (!valid_port_string(port))
+        return -1;
+
+    if (port_entry_exists(ports, protocols, *port_count, proto, port))
+        return 0;
+
+    if (*port_count >= MAX_PORTS)
+        return -1;
+
+    snprintf(protocols[*port_count], 4, "%s", proto);
+    snprintf(ports[*port_count], 16, "%s", port);
+    (*port_count)++;
+    return 1;
+}
+
+static int detect_ssh_connection_port(char *port, size_t port_len) {
+    const char *value = getenv("SSH_CONNECTION");
+    char client_ip[128];
+    char client_port[16];
+    char server_ip[128];
+    char server_port[16];
+
+    if (value == NULL || value[0] == '\0')
+        return 0;
+
+    if (sscanf(value, "%127s %15s %127s %15s",
+                client_ip, client_port, server_ip, server_port) != 4)
+        return 0;
+
+    if (!valid_port_string(server_port))
+        return 0;
+
+    snprintf(port, port_len, "%s", server_port);
+    return 1;
+}
+
+static int detect_ssh_client_port(char *port, size_t port_len) {
+    const char *value = getenv("SSH_CLIENT");
+    char client_ip[128];
+    char client_port[16];
+    char server_port[16];
+
+    if (value == NULL || value[0] == '\0')
+        return 0;
+
+    if (sscanf(value, "%127s %15s %15s",
+                client_ip, client_port, server_port) != 3)
+        return 0;
+
+    if (!valid_port_string(server_port))
+        return 0;
+
+    snprintf(port, port_len, "%s", server_port);
+    return 1;
+}
+
+static int add_ssh_fallback_ports(char ports[MAX_PORTS][16],
+        char protocols[MAX_PORTS][4],
+        int *port_count) {
+    char detected_port[16];
+    int rv;
+
+    rv = add_port_entry(ports, protocols, port_count, "tcp", "22");
+    if (rv < 0) {
+        printf("Failed to keep SSH fallback port tcp/22 open.\n");
+        return -1;
+    }
+    if (rv > 0)
+        printf("The SSH fallback port tcp/22 will be kept open to avoid lockout.\n");
+
+    if (detect_ssh_connection_port(detected_port, sizeof(detected_port))
+            || detect_ssh_client_port(detected_port, sizeof(detected_port))) {
+        if (strcmp(detected_port, "22") == 0)
+            return 0;
+
+        rv = add_port_entry(ports, protocols, port_count, "tcp", detected_port);
+        if (rv < 0) {
+            printf("Failed to keep detected SSH port tcp/%s open.\n", detected_port);
+            return -1;
+        }
+        if (rv > 0)
+            printf("Detected current SSH server port tcp/%s; it will be kept open.\n",
+                    detected_port);
+    }
+
+    return 0;
+}
+
 static void strip_line_end(char *line) {
     line[strcspn(line, "\r\n")] = '\0';
 }
@@ -2045,15 +2222,15 @@ static int line_was_truncated(const char *line, FILE *fp) {
     return len > 0 && line[len - 1] != '\n' && !feof(fp);
 }
 
-static int emit_merged_input_rules(FILE *temp_rules,
-        const input_rule_list_t *existing_input_rules,
+static int emit_rebuilt_input_rules(FILE *temp_rules,
         char ports[MAX_PORTS][16],
         char protocols[MAX_PORTS][4],
-        int port_count) {
+        int port_count,
+        const char *fwknop_input_chain,
+        int add_fwknop_input_jump) {
     input_rule_list_t *merged_rules = NULL;
     input_rule_list_t *merged_tail = NULL;
     input_rule_list_t *rule = NULL;
-    const input_rule_list_t *existing_rule = NULL;
     char port_rule[128];
     int i;
     int rv = -1;
@@ -2080,11 +2257,12 @@ static int emit_merged_input_rules(FILE *temp_rules,
             goto cleanup;
     }
 
-    for (existing_rule = existing_input_rules;
-            existing_rule != NULL;
-            existing_rule = existing_rule->next) {
-        if (append_unique_rule(&merged_rules, &merged_tail,
-                    existing_rule->rule) != 0)
+    if (add_fwknop_input_jump && fwknop_input_chain != NULL
+            && fwknop_input_chain[0] != '\0') {
+        snprintf(port_rule, sizeof(port_rule),
+                "-A INPUT -j %s", fwknop_input_chain);
+
+        if (append_unique_rule(&merged_rules, &merged_tail, port_rule) != 0)
             goto cleanup;
     }
 
@@ -2102,15 +2280,15 @@ static int build_input_only_rules_file(const char *source_path,
         const char *dest_path,
         char ports[MAX_PORTS][16],
         char protocols[MAX_PORTS][4],
-        int port_count) {
+        int port_count,
+        const char *fwknop_input_chain) {
     FILE *current_rules = NULL;
     FILE *temp_rules = NULL;
-    input_rule_list_t *existing_input_rules = NULL;
-    input_rule_list_t *existing_tail = NULL;
     char line[MAX_RULE_LINE];
     int in_filter = 0;
     int saw_filter = 0;
     int saw_input_chain = 0;
+    int saw_fwknop_input_chain = 0;
     int rv = -1;
 
     current_rules = fopen(source_path, "r");
@@ -2147,9 +2325,10 @@ static int build_input_only_rules_file(const char *source_path,
             if (!saw_input_chain)
                 fprintf(temp_rules, ":INPUT DROP [0:0]\n");
 
-            if (emit_merged_input_rules(temp_rules, existing_input_rules,
-                        ports, protocols, port_count) != 0) {
-                printf("Failed to merge INPUT chain rules.\n");
+            if (emit_rebuilt_input_rules(temp_rules,
+                        ports, protocols, port_count, fwknop_input_chain,
+                        saw_fwknop_input_chain) != 0) {
+                printf("Failed to rebuild INPUT chain rules.\n");
                 goto cleanup;
             }
 
@@ -2164,11 +2343,10 @@ static int build_input_only_rules_file(const char *source_path,
             continue;
         }
 
+        if (in_filter && chain_definition_matches(line, fwknop_input_chain))
+            saw_fwknop_input_chain = 1;
+
         if (in_filter && strncmp(line, "-A INPUT ", 9) == 0) {
-            if (append_rule(&existing_input_rules, &existing_tail, line) != 0) {
-                printf("Failed to collect existing INPUT chain rule.\n");
-                goto cleanup;
-            }
             continue;
         }
 
@@ -2188,9 +2366,9 @@ static int build_input_only_rules_file(const char *source_path,
     if (!saw_filter) {
         fprintf(temp_rules, "*filter\n");
         fprintf(temp_rules, ":INPUT DROP [0:0]\n");
-        if (emit_merged_input_rules(temp_rules, existing_input_rules,
-                    ports, protocols, port_count) != 0) {
-            printf("Failed to merge INPUT chain rules.\n");
+        if (emit_rebuilt_input_rules(temp_rules,
+                    ports, protocols, port_count, fwknop_input_chain, 0) != 0) {
+            printf("Failed to rebuild INPUT chain rules.\n");
             goto cleanup;
         }
         fprintf(temp_rules, "COMMIT\n");
@@ -2199,7 +2377,6 @@ static int build_input_only_rules_file(const char *source_path,
     rv = 0;
 
 cleanup:
-    free_rule_list(existing_input_rules);
     fclose(current_rules);
     fclose(temp_rules);
 
@@ -2290,14 +2467,17 @@ static int save_runtime_persistent_rules(void) {
 int initialize_firewall(fko_srv_options_t * const opts) {
     char ports[MAX_PORTS][16];
     char protocols[MAX_PORTS][4];
+    char port_buf[16];
+    const char *listener_proto;
     int port_count = 0;
     char choice;
     unsigned int enable_udp_server = 0; 
+    unsigned short port;
     printf("\nFirewall Initialization\n");
     printf("======================\n");
     printf("This will update only the INPUT chain.\n");
     printf("Other chains and tables will be preserved.\n");
-    printf("Existing INPUT rules will be merged after PortGuard allow rules.\n");
+    printf("Existing INPUT rules will be replaced with PortGuard allow rules.\n");
     printf("Recommended: Have physical console access or\n");
     printf("a secondary SSH session open as backup.\n");
     printf("Continue? (y/n): ");
@@ -2311,24 +2491,31 @@ int initialize_firewall(fko_srv_options_t * const opts) {
         strncasecmp(opts->config[CONF_ENABLE_UDP_SERVER], "Y", 1) == 0)
         {
             enable_udp_server = 1;
-            strcpy(protocols[0], "udp");
-        }else{
-            strcpy(protocols[0], "tcp");
         }
-    unsigned short port = enable_udp_server ? opts->udpserv_port : opts->tcpserv_port;
-    port_count = 1;
-    snprintf(ports[0], 16, "%u", port);
+    port = enable_udp_server ? opts->udpserv_port : opts->tcpserv_port;
+    listener_proto = enable_udp_server ? "udp" : "tcp";
+    snprintf(port_buf, sizeof(port_buf), "%u", port);
+    if (add_port_entry(ports, protocols, &port_count, listener_proto, port_buf) < 0) {
+        printf("Failed to add fwknop listener port to firewall rules.\n");
+        return -1;
+    }
+    printf("\nThe %s port %d listened to by fwknop will be added to the firewall rules.\n",
+            listener_proto, port);
+    if (add_ssh_fallback_ports(ports, protocols, &port_count) != 0)
+        return -1;
     // Configure ports to open
     printf("\nConfigure additional ports to open (y/n)? ");
     scanf(" %c", &choice);
     while(getchar() != '\n'); 
     if (choice == 'y' || choice == 'Y') {
-        printf("\nThe %s port %d listened to by fwknop will be added to the firewall rules.\n",protocols[0], port);
         printf("\nEnter ports to open (protocol port, e.g., 'tcp 22' or 'udp 53')\n");
-        printf("Enter 'done' when finished (max %d ports):\n", MAX_PORTS);
+        printf("Enter 'done' when finished (up to %d total allow ports):\n", MAX_PORTS);
         
         while (port_count < MAX_PORTS) {
             char input[32];
+            char proto[4];
+            char allow_port[16];
+            int add_rv;
             printf("Port %d (format 'proto port' or 'done'): ", port_count + 1);
             
             // Read entire line
@@ -2345,27 +2532,30 @@ int initialize_firewall(fko_srv_options_t * const opts) {
             }
             
             // Parse protocol and port
-            if (sscanf(input, "%3s %15s", protocols[port_count], ports[port_count]) != 2) {
+            if (sscanf(input, "%3s %15s", proto, allow_port) != 2) {
                 printf("Invalid format. Use 'tcp 22' or 'udp 53' format.\n");
                 continue;
             }
             
             // Validate protocol
-            if (strcmp(protocols[port_count], "tcp") != 0 && 
-                strcmp(protocols[port_count], "udp") != 0) {
+            if (strcmp(proto, "tcp") != 0 && strcmp(proto, "udp") != 0) {
                 printf("Invalid protocol. Only 'tcp' or 'udp' allowed.\n");
                 continue;
             }
             
             // Validate port number
-            char* endptr;
-            long port_num = strtol(ports[port_count], &endptr, 10);
-            if (*endptr != '\0' || port_num < 1 || port_num > 65535) {
+            if (!valid_port_string(allow_port)) {
                 printf("Invalid port number. Must be 1-65535.\n");
                 continue;
             }
             
-            port_count++;
+            add_rv = add_port_entry(ports, protocols, &port_count, proto, allow_port);
+            if (add_rv < 0) {
+                printf("Unable to add port rule. Maximum number of ports reached.\n");
+                continue;
+            }
+            if (add_rv == 0)
+                printf("Port rule already configured; skipping duplicate.\n");
         }
     }
 
@@ -2376,8 +2566,9 @@ int initialize_firewall(fko_srv_options_t * const opts) {
     }
 
     if (build_input_only_rules_file(BACKUP_RULES_FILE, TEMP_RULES_FILE,
-                ports, protocols, port_count) != 0) {
-        printf("Failed to prepare merged INPUT chain rules. Aborting.\n");
+                ports, protocols, port_count,
+                opts->fw_config->chain[IPT_INPUT_ACCESS].to_chain) != 0) {
+        printf("Failed to prepare rebuilt INPUT chain rules. Aborting.\n");
         return -1;
     }
     

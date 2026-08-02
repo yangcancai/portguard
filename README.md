@@ -34,13 +34,96 @@ upstream fwknop foundation:
  * PortGuard-specific server configuration options:
    `PORTGUARD_CLIENT_SERVER`, `PORTGUARD_SECTION_NAME`, and
    `PORTGUARD_ALLOW_IP`.
+ * Explicit `ACCESS ANY` authorization through `OPEN_PORTS ANY`, with a
+   source-IP-only temporary firewall rule and rejection when unrestricted
+   access was not explicitly enabled.
+ * Unique Rijndael and HMAC keys generated atomically on first server startup;
+   release packages contain no working default keys and preserve configured
+   keys on later starts and upgrades.
  * A firewall console mode (`fwknopd --fw-console`) for listing rules, adding
    port rules, deleting rules, persisting rules on Debian/RHEL-family systems,
-   and initializing the `INPUT` chain while preserving other chains and merging
-   existing `INPUT` rules.
+   and rebuilding the `INPUT` chain while preserving other chains and tables.
  * Systemd-ready server packaging that installs `fwknopd` and `libfko` together
    as the PortGuard Server package.
  * OpenWrt SDK-based package builds for router deployments.
+
+## Debian 13 Firewall Docker Test
+
+To test `fwknopd --fw-console` without touching a real server firewall, run:
+
+```bash
+scripts/run-debian13-fwtest-docker.sh
+```
+
+By default, the script builds a Debian 13 package from the current source tree,
+starts a privileged Debian 13 Docker container, installs PortGuard Server,
+starts local TCP listeners on ports `22` and `7700`, initializes the container
+`INPUT` chain, verifies that `tcp/22` and `udp/62201` are explicitly open, then
+starts `fwknopd` and enters an interactive shell. The container also creates an
+isolated network namespace as the test client so traffic really crosses the
+server container's `INPUT` chain. With `--auto-knock`, it first verifies that
+`ACCESS ANY` is rejected without explicit authorization, then enables
+`OPEN_PORTS ANY` and verifies the resulting source-only all-access rule.
+
+Inside the container shell, confirm that the test service is blocked before the
+SPA knock:
+
+```bash
+pg-fwtest-probe
+```
+
+Send a manual SPA packet:
+
+```bash
+pg-fwtest-knock
+```
+
+Then retry the TCP probe:
+
+```bash
+pg-fwtest-probe
+```
+
+To run the whole manual flow in one command:
+
+```bash
+pg-fwtest-check
+```
+
+The container also provides helper commands:
+
+```bash
+pg-fwtest-status
+pg-fwtest-rules
+pg-fwtest-probe
+pg-fwtest-knock
+pg-fwtest-check
+fwknopd -Q
+fwknopd --fw-console
+```
+
+The Debian 13 test container adds a local `fwknopd` convenience wrapper so
+manual commands automatically use `/etc/fwknop/fwknopd.conf` and
+`/etc/fwknop/access.conf`.
+
+On Docker Desktop for macOS, host port forwarding may not prove container
+`INPUT` filtering, so prefer the in-container namespace helpers above for the
+firewall check.
+
+To test the currently published official installer instead of the local source
+tree, run:
+
+```bash
+scripts/run-debian13-fwtest-docker.sh --official
+```
+
+For non-interactive smoke checks, add `--exit-after-ready` so the container
+exits after setup and firewall verification.
+
+To include one automatic SPA knock in the smoke check, add `--auto-knock`.
+
+The firewall changes happen inside the Docker container network namespace only.
+They do not modify the host firewall.
 
 ## Introduction
 fwknop implements an authorization scheme known as Single Packet Authorization

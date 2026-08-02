@@ -286,6 +286,13 @@ validate_access_msg(const char *msg)
     if(ndx == NULL || (1+(ndx - msg)) >= startlen)
         return(FKO_ERROR_INVALID_SPA_ACCESS_MSG);
 
+    /* PortGuard extension: ANY is a complete access specification.  The
+     * server applies the authorization policy before creating an all-access
+     * firewall rule for the requested source address.
+    */
+    if(strcmp(ndx+1, "ANY") == 0)
+        return(FKO_SUCCESS);
+
     /* Look for a comma to see if this is a multi-part access request.
     */
     do {

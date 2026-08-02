@@ -516,6 +516,7 @@ our %cf = (
     "${fw_conf_prefix}_snat_translate_ip"    => "$conf_dir/${fw_conf_prefix}_snat_translate_ip_fwknopd.conf",
     'def'                          => "$conf_dir/default_fwknopd.conf",
     'def_access'                   => "$conf_dir/default_access.conf",
+    'any_open_ports_access'        => "$conf_dir/any_open_ports_access.conf",
     'portrange_filter'             => "$conf_dir/portrange_fwknopd.conf",
     'hmac_access'                  => "$conf_dir/hmac_access.conf",
     'include1_hmac_access'         => "$conf_dir/include1_hmac_access.conf",

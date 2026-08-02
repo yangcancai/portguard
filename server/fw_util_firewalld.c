@@ -1494,11 +1494,12 @@ int
 process_spa_request(const fko_srv_options_t * const opts,
         const acc_stanza_t * const acc, spa_data_t * const spadat)
 {
+    char            rule_buf[CMD_BUFSIZE] = {0};
     char            nat_ip[MAX_IPV4_STR_LEN] = {0};
     char            nat_dst[MAX_HOSTNAME_LEN] = {0};
     unsigned int    nat_port = 0;
-    unsigned int    fst_proto;
-    unsigned int    fst_port;
+    unsigned int    fst_proto = ANY_PROTO;
+    unsigned int    fst_port = ANY_PORT;
 
     struct fw_chain * const in_chain   = &(opts->fw_config->chain[FIREWD_INPUT_ACCESS]);
     struct fw_chain * const out_chain  = &(opts->fw_config->chain[FIREWD_OUTPUT_ACCESS]);
@@ -1510,13 +1511,22 @@ process_spa_request(const fko_srv_options_t * const opts,
 
     char            *ndx = NULL;
     int             res = 0, is_err;
+    int             access_any = strcmp(spadat->spa_message_remain, "ANY") == 0;
     int             str_len;
     time_t          now;
     unsigned int    exp_ts;
 
+    if(access_any && (acc->force_nat
+            || spadat->message_type == FKO_LOCAL_NAT_ACCESS_MSG
+            || spadat->message_type == FKO_CLIENT_TIMEOUT_LOCAL_NAT_ACCESS_MSG
+            || spadat->message_type == FKO_NAT_ACCESS_MSG
+            || spadat->message_type == FKO_CLIENT_TIMEOUT_NAT_ACCESS_MSG))
+        return res;
+
     /* Parse and expand our access message.
     */
-    if(expand_acc_port_list(&port_list, spadat->spa_message_remain) != 1)
+    if(!access_any
+            && expand_acc_port_list(&port_list, spadat->spa_message_remain) != 1)
     {
         /* technically we would already have exited with an error if there were
          * any memory allocation errors (see the add_port_list() function), but
@@ -1533,8 +1543,11 @@ process_spa_request(const fko_srv_options_t * const opts,
     /* Remember the first proto/port combo in case we need them
      * for NAT access requests.
     */
-    fst_proto = ple->proto;
-    fst_port  = ple->port;
+    if(!access_any)
+    {
+        fst_proto = ple->proto;
+        fst_port  = ple->port;
+    }
 
     /* Set our expire time value.
     */
@@ -1643,6 +1656,36 @@ process_spa_request(const fko_srv_options_t * const opts,
     }
     else /* Non-NAT request - this is the typical case. */
     {
+        if(access_any)
+        {
+            snprintf(rule_buf, CMD_BUFSIZE-1, FIREWD_ANY_ACCESS_RULE_ARGS,
+                in_chain->table,
+                spadat->use_src_ip,
+                (fwc.use_destination ? spadat->pkt_destination_ip : FIREWD_ANY_IP),
+                exp_ts,
+                in_chain->target
+            );
+            firewd_rule(opts, rule_buf, NULL, spadat->use_src_ip,
+                (fwc.use_destination ? spadat->pkt_destination_ip : FIREWD_ANY_IP),
+                ANY_PROTO, ANY_PORT, NULL, NAT_ANY_PORT,
+                in_chain, exp_ts, now, "access", spadat->spa_message_remain);
+
+            if(strlen(out_chain->to_chain))
+            {
+                snprintf(rule_buf, CMD_BUFSIZE-1, FIREWD_OUT_ANY_ACCESS_RULE_ARGS,
+                    out_chain->table,
+                    spadat->use_src_ip,
+                    (fwc.use_destination ? spadat->pkt_destination_ip : FIREWD_ANY_IP),
+                    exp_ts,
+                    out_chain->target
+                );
+                firewd_rule(opts, rule_buf, NULL, spadat->use_src_ip,
+                    (fwc.use_destination ? spadat->pkt_destination_ip : FIREWD_ANY_IP),
+                    ANY_PROTO, ANY_PORT, NULL, NAT_ANY_PORT,
+                    out_chain, exp_ts, now, "OUTPUT", spadat->spa_message_remain);
+            }
+        }
+
         /* Create an access command for each proto/port for the source ip.
         */
         while(ple != NULL)

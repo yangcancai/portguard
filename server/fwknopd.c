@@ -162,6 +162,13 @@ main(int argc, char **argv)
             clean_exit(&opts, FW_CLEANUP, EXIT_SUCCESS);
         }
 
+        if(opts.config[CONF_ACCESS_FOLDER] == NULL
+                && initialize_access_file_keys(opts.config[CONF_ACCESS_FILE])
+                    != EXIT_SUCCESS)
+        {
+            clean_exit(&opts, NO_FW_CLEANUP, EXIT_FAILURE);
+        }
+
         if (opts.config[CONF_ACCESS_FOLDER] != NULL) //If we have an access folder, process it
         {
             if (parse_access_folder(&opts, opts.config[CONF_ACCESS_FOLDER], &depth) != EXIT_SUCCESS)

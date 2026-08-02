@@ -636,7 +636,7 @@ This defines the destination address for which the SPA packet will be accepted\&
 .RS 4
 Define a set of ports and protocols (tcp or udp) that will be opened if a valid knock sequence is seen\&. If this entry is not set,
 \fBfwknopd\fR
-will attempt to honor any proto/port request specified in the SPA data (unless of it matches any \(lqRESTRICT_PORTS\(rq entries)\&. Multiple entries are comma\-separated\&.
+will attempt to honor any proto/port request specified in the SPA data (unless of it matches any \(lqRESTRICT_PORTS\(rq entries)\&. Multiple entries are comma\-separated\&. Setting this value explicitly to \(lqANY\(rq also authorizes the special SPA request \(lqACCESS ANY\(rq, which temporarily allows the requested source IP to access all protocols and ports\&. \(lqACCESS ANY\(rq is rejected when \(lqRESTRICT_PORTS\(rq is configured and is not supported for NAT or command\-cycle requests\&. Leaving \(lqOPEN_PORTS\(rq unset still permits arbitrary individual proto/port requests, but does not authorize \(lqACCESS ANY\(rq\&.
 .RE
 .PP
 \fBRESTRICT_PORTS\fR \fI<proto/port>,\&...,<proto/port>\fR

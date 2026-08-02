@@ -39,6 +39,7 @@
 #include "log_msg.h"
 #include "cmd_cycle.h"
 #include <dirent.h>
+#include <fcntl.h>
 
 #define FATAL_ERR -1
 
@@ -66,6 +67,347 @@ int
 include_keys_file(acc_stanza_t *, const char *, fko_srv_options_t *);
 
 static int do_acc_stanza_init = 1;
+
+enum access_key_state
+{
+    ACCESS_KEY_MISSING = 0,
+    ACCESS_KEY_PLACEHOLDER,
+    ACCESS_KEY_CONFIGURED
+};
+
+static void zero_buf_wrapper(char *buf, int len);
+
+static int
+access_key_line(const char *line, int *is_hmac, int *is_placeholder)
+{
+    char var[MAX_LINE_LEN] = {0};
+    char val[MAX_LINE_LEN] = {0};
+    char *ndx;
+
+    *is_hmac = 0;
+    *is_placeholder = 0;
+
+    if(IS_EMPTY_LINE(line[0])
+            || sscanf(line, "%1023s %1023[^;\n\r]", var, val) != 2)
+        return 0;
+
+    if((ndx = strrchr(var, ':')) != NULL)
+        *ndx = '\0';
+    chop_whitespace(val);
+
+    if(strcmp(var, "KEY_BASE64") == 0)
+    {
+        *is_placeholder = strcmp(val, PORTGUARD_KEY_PLACEHOLDER) == 0;
+        return 1;
+    }
+    if(strcmp(var, "HMAC_KEY_BASE64") == 0)
+    {
+        *is_hmac = 1;
+        *is_placeholder = strcmp(val, PORTGUARD_KEY_PLACEHOLDER) == 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+scan_access_key_states(FILE *file_ptr, int *key_state, int *hmac_state)
+{
+    char line[MAX_LINE_LEN] = {0};
+    int is_hmac, is_placeholder;
+    int *state;
+
+    *key_state = ACCESS_KEY_MISSING;
+    *hmac_state = ACCESS_KEY_MISSING;
+    rewind(file_ptr);
+
+    while(fgets(line, sizeof(line), file_ptr) != NULL)
+    {
+        if(!access_key_line(line, &is_hmac, &is_placeholder))
+            continue;
+
+        state = is_hmac ? hmac_state : key_state;
+        if(*state != ACCESS_KEY_MISSING)
+        {
+            log_msg(LOG_ERR,
+                "[*] Refusing first-start key generation: duplicate %s directive",
+                is_hmac ? "HMAC_KEY_BASE64" : "KEY_BASE64");
+            return 0;
+        }
+        *state = is_placeholder
+            ? ACCESS_KEY_PLACEHOLDER : ACCESS_KEY_CONFIGURED;
+    }
+
+    if(ferror(file_ptr))
+    {
+        log_msg(LOG_ERR, "[*] Error reading access file during key initialization");
+        return 0;
+    }
+
+    return 1;
+}
+
+static int
+access_file_needs_keys(const char *access_filename)
+{
+    FILE *file_ptr;
+    int key_state, hmac_state;
+    int res = -1;
+
+    file_ptr = fopen(access_filename, "r");
+    if(file_ptr == NULL)
+    {
+        log_msg(LOG_ERR, "[*] Could not open access file for key initialization: %s: %s",
+            access_filename, strerror(errno));
+        return -1;
+    }
+
+    if(!scan_access_key_states(file_ptr, &key_state, &hmac_state))
+        goto cleanup;
+
+    if(key_state == ACCESS_KEY_PLACEHOLDER
+            || hmac_state == ACCESS_KEY_PLACEHOLDER)
+    {
+        if(key_state != ACCESS_KEY_PLACEHOLDER
+                || hmac_state != ACCESS_KEY_PLACEHOLDER)
+        {
+            log_msg(LOG_ERR,
+                "[*] Refusing first-start key generation: both key placeholders are required");
+            goto cleanup;
+        }
+        res = 1;
+    }
+    else
+        res = 0;
+
+cleanup:
+    fclose(file_ptr);
+    return res;
+}
+
+static int
+lock_access_key_initialization(const char *access_filename,
+        char *lock_path, size_t lock_path_len)
+{
+    struct flock lock;
+    int lock_fd;
+
+    if(snprintf(lock_path, lock_path_len, "%s.key-init.lock", access_filename)
+            >= (int)lock_path_len)
+    {
+        log_msg(LOG_ERR, "[*] Access file path is too long for key initialization lock");
+        return -1;
+    }
+
+    lock_fd = open(lock_path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+    if(lock_fd < 0)
+    {
+        log_msg(LOG_ERR, "[*] Could not open key initialization lock %s: %s",
+            lock_path, strerror(errno));
+        return -1;
+    }
+
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+
+    while(fcntl(lock_fd, F_SETLKW, &lock) < 0)
+    {
+        if(errno == EINTR)
+            continue;
+        log_msg(LOG_ERR, "[*] Could not lock first-start key initialization: %s",
+            strerror(errno));
+        close(lock_fd);
+        return -1;
+    }
+
+    return lock_fd;
+}
+
+static void
+unlock_access_key_initialization(int lock_fd)
+{
+    struct flock lock;
+
+    if(lock_fd < 0)
+        return;
+
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    fcntl(lock_fd, F_SETLK, &lock);
+    close(lock_fd);
+}
+
+int
+initialize_access_file_keys(const char *access_filename)
+{
+    FILE *source = NULL;
+    FILE *dest = NULL;
+    struct stat source_stat;
+    char key_base64[MAX_B64_KEY_LEN+1] = {0};
+    char hmac_key_base64[MAX_B64_KEY_LEN+1] = {0};
+    char lock_path[MAX_PATH_LEN] = {0};
+    char temp_path[MAX_PATH_LEN] = {0};
+    char line[MAX_LINE_LEN] = {0};
+    int key_state, hmac_state;
+    int is_hmac, is_placeholder;
+    int key_replaced = 0, hmac_replaced = 0;
+    int lock_fd = -1, temp_fd = -1;
+    int needs_keys, res = EXIT_FAILURE;
+
+    if(access_filename == NULL || !is_valid_file(access_filename))
+    {
+        log_msg(LOG_ERR, "[*] Invalid access file for first-start key initialization");
+        return EXIT_FAILURE;
+    }
+
+    needs_keys = access_file_needs_keys(access_filename);
+    if(needs_keys < 0)
+        return EXIT_FAILURE;
+    if(needs_keys == 0)
+        return EXIT_SUCCESS;
+
+    lock_fd = lock_access_key_initialization(access_filename,
+        lock_path, sizeof(lock_path));
+    if(lock_fd < 0)
+        return EXIT_FAILURE;
+
+    /* Another process may have completed initialization while we waited. */
+    needs_keys = access_file_needs_keys(access_filename);
+    if(needs_keys < 0)
+        goto cleanup;
+    if(needs_keys == 0)
+    {
+        res = EXIT_SUCCESS;
+        goto cleanup;
+    }
+
+    source = fopen(access_filename, "r");
+    if(source == NULL)
+    {
+        log_msg(LOG_ERR, "[*] Could not reopen access file for key initialization: %s",
+            strerror(errno));
+        goto cleanup;
+    }
+    if(fstat(fileno(source), &source_stat) != 0 || !S_ISREG(source_stat.st_mode))
+    {
+        log_msg(LOG_ERR, "[*] Access file is not a regular file during key initialization");
+        goto cleanup;
+    }
+    if(!scan_access_key_states(source, &key_state, &hmac_state)
+            || key_state != ACCESS_KEY_PLACEHOLDER
+            || hmac_state != ACCESS_KEY_PLACEHOLDER)
+    {
+        log_msg(LOG_ERR, "[*] Access key placeholders changed during initialization");
+        goto cleanup;
+    }
+
+    if(fko_key_gen(key_base64, FKO_DEFAULT_KEY_LEN,
+            hmac_key_base64, FKO_DEFAULT_HMAC_KEY_LEN,
+            FKO_DEFAULT_HMAC_MODE) != FKO_SUCCESS)
+    {
+        log_msg(LOG_ERR, "[*] Could not generate first-start access keys");
+        goto cleanup;
+    }
+
+    if(snprintf(temp_path, sizeof(temp_path), "%s.key-init.XXXXXX", access_filename)
+            >= (int)sizeof(temp_path))
+    {
+        log_msg(LOG_ERR, "[*] Access file path is too long for atomic key initialization");
+        goto cleanup;
+    }
+
+    temp_fd = mkstemp(temp_path);
+    if(temp_fd < 0)
+    {
+        log_msg(LOG_ERR, "[*] Could not create temporary access file: %s",
+            strerror(errno));
+        goto cleanup;
+    }
+    if(fchmod(temp_fd, S_IRUSR | S_IWUSR) != 0)
+    {
+        log_msg(LOG_ERR, "[*] Could not secure temporary access file: %s",
+            strerror(errno));
+        goto cleanup;
+    }
+
+    dest = fdopen(temp_fd, "w");
+    if(dest == NULL)
+    {
+        log_msg(LOG_ERR, "[*] Could not open temporary access file stream: %s",
+            strerror(errno));
+        goto cleanup;
+    }
+    temp_fd = -1;
+    rewind(source);
+
+    while(fgets(line, sizeof(line), source) != NULL)
+    {
+        if(access_key_line(line, &is_hmac, &is_placeholder) && is_placeholder)
+        {
+            if(is_hmac)
+            {
+                if(fprintf(dest, "HMAC_KEY_BASE64             %s\n",
+                        hmac_key_base64) < 0)
+                    goto write_error;
+                hmac_replaced++;
+            }
+            else
+            {
+                if(fprintf(dest, "KEY_BASE64                  %s\n",
+                        key_base64) < 0)
+                    goto write_error;
+                key_replaced++;
+            }
+        }
+        else if(fputs(line, dest) == EOF)
+            goto write_error;
+    }
+
+    if(ferror(source) || key_replaced != 1 || hmac_replaced != 1)
+    {
+        errno = EINVAL;
+        goto write_error;
+    }
+    if(fflush(dest) != 0 || fsync(fileno(dest)) != 0)
+        goto write_error;
+    if(fclose(dest) != 0)
+    {
+        dest = NULL;
+        goto write_error;
+    }
+    dest = NULL;
+
+    if(rename(temp_path, access_filename) != 0)
+    {
+        log_msg(LOG_ERR, "[*] Could not atomically install generated access keys: %s",
+            strerror(errno));
+        goto cleanup;
+    }
+    temp_path[0] = '\0';
+    log_msg(LOG_INFO, "Generated unique first-start keys in %s", access_filename);
+    res = EXIT_SUCCESS;
+    goto cleanup;
+
+write_error:
+    log_msg(LOG_ERR, "[*] Could not write initialized access file: %s",
+        strerror(errno));
+
+cleanup:
+    if(source != NULL)
+        fclose(source);
+    if(dest != NULL)
+        fclose(dest);
+    if(temp_fd >= 0)
+        close(temp_fd);
+    if(temp_path[0] != '\0')
+        unlink(temp_path);
+    zero_buf_wrapper(key_base64, sizeof(key_base64));
+    zero_buf_wrapper(hmac_key_base64, sizeof(hmac_key_base64));
+    unlock_access_key_initialization(lock_fd);
+    return res;
+}
 
 void enable_acc_stanzas_init(void)
 {
@@ -993,7 +1335,8 @@ expand_acc_ent_lists(fko_srv_options_t *opts)
         */
         if(acc->open_ports != NULL && strlen(acc->open_ports))
         {
-            if(expand_acc_port_list(&(acc->oport_list), acc->open_ports) == 0)
+            if(strcasecmp(acc->open_ports, "ANY") != 0
+                    && expand_acc_port_list(&(acc->oport_list), acc->open_ports) == 0)
             {
                 log_msg(LOG_ERR, "[*] Fatal invalid OPEN_PORTS in access stanza");
                 clean_exit(opts, NO_FW_CLEANUP, EXIT_FAILURE);
@@ -2122,6 +2465,18 @@ acc_check_port_access(acc_stanza_t *acc, char *port_str)
 
     acc_port_list_t *in_pl  = NULL;
 
+    /* ACCESS ANY is deliberately more privileged than requesting arbitrary
+     * individual ports.  Require an explicit OPEN_PORTS ANY declaration and
+     * reject it when restricted ports are configured because one all-access
+     * firewall rule cannot preserve those exclusions.
+    */
+    if(strcmp(port_str, "ANY") == 0)
+    {
+        return acc->open_ports != NULL
+            && strcasecmp(acc->open_ports, "ANY") == 0
+            && acc->rport_list == NULL;
+    }
+
     start = port_str;
 
     /* Create our own internal port_list from the incoming SPA data
@@ -2501,10 +2856,27 @@ DECLARE_UTEST(compare_port_list, "check compare_port_list function")
     CU_ASSERT(compare_port_list(acc_pl, in2_pl, 0) == 1);	/* All ports must match in2 port list - 2 */
 }
 
+DECLARE_UTEST(check_any_port_access, "check ACCESS ANY authorization")
+{
+    acc_stanza_t acc;
+
+    memset(&acc, 0, sizeof(acc));
+    CU_ASSERT(acc_check_port_access(&acc, "ANY") == 0);
+
+    acc.open_ports = "ANY";
+    CU_ASSERT(acc_check_port_access(&acc, "ANY") == 1);
+    CU_ASSERT(acc_check_port_access(&acc, "tcp/22") == 1);
+
+    expand_acc_port_list(&acc.rport_list, "tcp/22");
+    CU_ASSERT(acc_check_port_access(&acc, "ANY") == 0);
+    free_acc_port_list(acc.rport_list);
+}
+
 int register_ts_access(void)
 {
     ts_init(&TEST_SUITE(access), TEST_SUITE_DESCR(access), NULL, NULL);
     ts_add_utest(&TEST_SUITE(access), UTEST_FCT(compare_port_list), UTEST_DESCR(compare_port_list));
+    ts_add_utest(&TEST_SUITE(access), UTEST_FCT(check_any_port_access), UTEST_DESCR(check_any_port_access));
 
     return register_ts(&TEST_SUITE(access));
 }

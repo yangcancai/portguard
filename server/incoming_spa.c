@@ -910,6 +910,18 @@ set_timeout(acc_stanza_t *acc, spa_data_t *spadat)
 static int
 check_port_proto(acc_stanza_t *acc, spa_data_t *spadat, const int stanza_num)
 {
+    if(strcmp(spadat->spa_message_remain, "ANY") == 0
+            && (acc->force_nat
+                || (spadat->message_type != FKO_ACCESS_MSG
+                    && spadat->message_type != FKO_CLIENT_TIMEOUT_ACCESS_MSG)))
+    {
+        log_msg(LOG_WARNING,
+            "[%s] (stanza #%d) ACCESS ANY is only valid for direct, non-NAT access requests.",
+            spadat->pkt_source_ip, stanza_num
+        );
+        return 0;
+    }
+
     if(! acc_check_port_access(acc, spadat->spa_message_remain))
     {
         log_msg(LOG_WARNING,

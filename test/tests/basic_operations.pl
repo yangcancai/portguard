@@ -4656,6 +4656,23 @@
     {
         'category' => 'basic operations',
         'subcategory' => 'server',
+        'detail'   => 'OPEN_PORTS ANY compatibility',
+        'function' => \&server_conf_files,
+        'fwknopd_cmdline' => "$server_rewrite_conf_files -D --exit-parse-config",
+        'server_access_file' => [
+            'SOURCE       1.1.1.1',
+            'OPEN_PORTS   ANY',
+            'KEY          testtest'
+        ],
+        'server_conf_file' => [
+            '### comment line'
+        ],
+        'positive_output_matches' => [qr/OPEN_PORTS:\s+ANY/],
+    },
+
+    {
+        'category' => 'basic operations',
+        'subcategory' => 'server',
         'detail'   => 'OPEN_PORTS format (1)',
         'function' => \&server_conf_files,
         'fwknopd_cmdline' => $server_rewrite_conf_files,

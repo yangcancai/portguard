@@ -143,6 +143,7 @@ EXTRA_DIST = \
     test/conf/cmd_giduid_access.conf \
     test/conf/ctr_mode_access.conf \
     test/conf/default_access.conf \
+    test/conf/any_open_ports_access.conf \
     test/conf/default_fwknopd.conf \
     test/conf/portrange_fwknopd.conf \
     test/conf/prepend_fwknopd.conf \

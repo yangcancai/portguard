@@ -2,6 +2,33 @@
     {
         'category' => 'Rijndael',
         'subcategory' => 'client+server',
+        'detail'   => 'ACCESS ANY with explicit OPEN_PORTS ANY authorization',
+        'function' => \&spa_cycle,
+        'cmdline'  => "$lib_view_str $valgrind_str $fwknopCmd -A ANY " .
+            "-a $fake_ip -D $loopback_ip --get-key $local_key_file " .
+            "--no-save-args $verbose_str",
+        'fwknopd_cmdline' => "$fwknopdCmd -c $cf{'def'} " .
+            "-a $cf{'any_open_ports_access'} -d $default_digest_file " .
+            "-p $default_pid_file $intf_str",
+        'fw_rule_created' => $NEW_RULE_REQUIRED,
+        'fw_rule_removed' => $NEW_RULE_REMOVED,
+    },
+    {
+        'category' => 'Rijndael',
+        'subcategory' => 'client+server',
+        'detail'   => 'ACCESS ANY denied without explicit OPEN_PORTS ANY',
+        'function' => \&spa_cycle,
+        'cmdline'  => "$lib_view_str $valgrind_str $fwknopCmd -A ANY " .
+            "-a $fake_ip -D $loopback_ip --get-key $local_key_file " .
+            "--no-save-args $verbose_str",
+        'fwknopd_cmdline' => "$fwknopdCmd $default_server_conf_args $intf_str",
+        'server_positive_output_matches' => [qr/requested protocol\/ports was denied/],
+        'fw_rule_created' => $REQUIRE_NO_NEW_RULE,
+        'fw_rule_removed' => $REQUIRE_NO_NEW_REMOVED,
+    },
+    {
+        'category' => 'Rijndael',
+        'subcategory' => 'client+server',
         'detail'   => 'complete cycle (tcp/22 ssh)',
         'function' => \&spa_cycle,
         'cmdline'  => $default_client_args,

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 PACKAGE_FILE=""
-VERIFY_ACCESS="${VERIFY_ACCESS:-tcp/22,tcp/443}"
+VERIFY_ACCESS="${VERIFY_ACCESS:-ANY}"
 VERIFY_KNOCK_PORT="${VERIFY_KNOCK_PORT:-62201}"
 VERIFY_SERVER_HOST="${VERIFY_SERVER_HOST:-verify.example.test}"
 VERIFY_SECTION_NAME="${VERIFY_SECTION_NAME:-verify-server}"
@@ -17,9 +17,10 @@ Install and verify a PortGuard Server package in the current OS image.
 Usage:
   scripts/verify-package.sh --package FILE
 
-The verifier installs the local .deb/.rpm, writes a temporary fwknopd config,
-checks parser/QR/key generation behavior, verifies dynamic libraries, and
-checks fw-console firewall persistence/merge behavior when iptables is usable.
+The verifier installs the local .deb/.rpm, checks first-start key generation,
+writes a temporary fwknopd config, checks parser/QR behavior, verifies dynamic
+libraries, and checks fw-console firewall persistence/rebuild behavior when
+iptables is usable.
 USAGE
 }
 
@@ -158,6 +159,56 @@ extract_key_field() {
   awk -F':[[:space:]]*' -v n="$name" '$1 == n {print $2; exit}'
 }
 
+extract_access_field() {
+  local name="$1"
+  awk -v n="$name" '$1 == n {print $2; exit}' /etc/fwknop/access.conf
+}
+
+verify_first_start_key_initialization() {
+  local marker key hmac key_bytes hmac_bytes first_hash second_hash
+
+  marker="__PORTGUARD_GENERATE_ON_FIRST_START__"
+  log "checking first-start access key generation"
+
+  [ "$(grep -Ec "^KEY_BASE64[[:space:]]+${marker}$" /etc/fwknop/access.conf)" = "1" ] \
+    || fail "packaged access.conf does not contain the KEY_BASE64 first-start placeholder"
+  [ "$(grep -Ec "^HMAC_KEY_BASE64[[:space:]]+${marker}$" /etc/fwknop/access.conf)" = "1" ] \
+    || fail "packaged access.conf does not contain the HMAC_KEY_BASE64 first-start placeholder"
+
+  fwknopd \
+    --exit-parse-config \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf
+
+  key="$(extract_access_field KEY_BASE64)"
+  hmac="$(extract_access_field HMAC_KEY_BASE64)"
+  [ -n "$key" ] && [ "$key" != "$marker" ] \
+    || fail "first start did not generate KEY_BASE64"
+  [ -n "$hmac" ] && [ "$hmac" != "$marker" ] \
+    || fail "first start did not generate HMAC_KEY_BASE64"
+  printf '%s' "$key" | grep -Eq '^[A-Za-z0-9+/=]+$' \
+    || fail "generated KEY_BASE64 is not valid base64 text"
+  printf '%s' "$hmac" | grep -Eq '^[A-Za-z0-9+/=]+$' \
+    || fail "generated HMAC_KEY_BASE64 is not valid base64 text"
+  key_bytes="$(printf '%s' "$key" | base64 --decode 2>/dev/null | wc -c | tr -d '[:space:]')"
+  hmac_bytes="$(printf '%s' "$hmac" | base64 --decode 2>/dev/null | wc -c | tr -d '[:space:]')"
+  [ "$key_bytes" = "32" ] \
+    || fail "generated KEY_BASE64 does not decode to 32 bytes"
+  [ "$hmac_bytes" = "64" ] \
+    || fail "generated HMAC_KEY_BASE64 does not decode to 64 bytes"
+  [ "$(stat -c '%a' /etc/fwknop/access.conf)" = "600" ] \
+    || fail "initialized access.conf does not have mode 600"
+
+  first_hash="$(sha256sum /etc/fwknop/access.conf | awk '{print $1}')"
+  fwknopd \
+    --exit-parse-config \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf
+  second_hash="$(sha256sum /etc/fwknop/access.conf | awk '{print $1}')"
+  [ "$first_hash" = "$second_hash" ] \
+    || fail "a later start unexpectedly rotated existing access keys"
+}
+
 write_verify_config() {
   local key_output key hmac firewall_exe
 
@@ -242,6 +293,7 @@ verify_fwknopd() {
     grep -q "SECTION_NAME:${VERIFY_SECTION_NAME}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected SECTION_NAME"
     grep -q "SPA_SERVER:${VERIFY_SERVER_HOST}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected SPA_SERVER"
     grep -q "ALLOW_IP:${VERIFY_ALLOW_IP}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected ALLOW_IP"
+    grep -q "ACCESS:${VERIFY_ACCESS}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected ACCESS"
     grep -q 'KEY_BASE64:' /tmp/fwknopd-qr.out || fail "fwknopd --qr output is missing KEY_BASE64"
     grep -q 'HMAC_KEY_BASE64:' /tmp/fwknopd-qr.out || fail "fwknopd --qr output is missing HMAC_KEY_BASE64"
     grep -q "FW_TIMEOUT:${VERIFY_TIMEOUT}" /tmp/fwknopd-qr.out || fail "fwknopd --qr output has unexpected FW_TIMEOUT"
@@ -283,17 +335,25 @@ files_equal() {
   [ "$(cksum < "$left")" = "$(cksum < "$right")" ]
 }
 
-verify_fw_console_input_merge() {
-  local backup prepared after before_non_input after_non_input out chain
+count_matching_rules() {
+  local pattern="$1"
+  local source="$2"
+
+  awk -v pattern="$pattern" 'BEGIN { count = 0 } $0 ~ pattern { count++ } END { print count }' "$source"
+}
+
+verify_fw_console_input_rebuild() {
+  local backup prepared after_first after before_non_input after_non_input out chain count
 
   if ! iptables_capable; then
-    log "iptables modification is unavailable; skipping fw-console INPUT merge check"
+    log "iptables modification is unavailable; skipping fw-console INPUT rebuild check"
     return 0
   fi
 
-  log "checking fwknopd --fw-console initializes only INPUT chain"
+  log "checking fwknopd --fw-console rebuilds only INPUT chain"
   backup="$(mktemp /tmp/portguard-fw-before.XXXXXX)"
   prepared="$(mktemp /tmp/portguard-fw-prepared.XXXXXX)"
+  after_first="$(mktemp /tmp/portguard-fw-after-first.XXXXXX)"
   after="$(mktemp /tmp/portguard-fw-after.XXXXXX)"
   before_non_input="$(mktemp /tmp/portguard-fw-before-non-input.XXXXXX)"
   after_non_input="$(mktemp /tmp/portguard-fw-after-non-input.XXXXXX)"
@@ -302,19 +362,35 @@ verify_fw_console_input_merge() {
 
   iptables-save > "$backup"
   (
-    trap 'iptables-restore < "$backup" >/dev/null 2>&1 || true; rm -f "$backup" "$prepared" "$after" "$before_non_input" "$after_non_input" "$out"' EXIT
+    trap 'iptables-restore < "$backup" >/dev/null 2>&1 || true; rm -f "$backup" "$prepared" "$after_first" "$after" "$before_non_input" "$after_non_input" "$out"' EXIT
 
+    iptables -F INPUT
+    iptables -P INPUT ACCEPT
     iptables -N "$chain"
     iptables -A "$chain" -j RETURN
     iptables -A FORWARD -j "$chain"
+    iptables -N FWKNOP_INPUT 2>/dev/null || true
+    iptables -F FWKNOP_INPUT
+    iptables -A FWKNOP_INPUT -j RETURN
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A INPUT -p udp --dport "$VERIFY_KNOCK_PORT" -j ACCEPT
+    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+    iptables -A INPUT -j FWKNOP_INPUT
     iptables -A INPUT -p tcp --dport 2222 -j ACCEPT
     iptables -A INPUT -j "$chain"
     iptables-save > "$prepared"
 
-    printf '1\ny\nn\n0\n' | timeout 15 fwknopd \
+    printf '1\ny\ny\ntcp 22\ndone\n0\n' | timeout 15 fwknopd \
       --fw-console \
       -c /etc/fwknop/fwknopd.conf \
       -a /etc/fwknop/access.conf > "$out"
+    iptables-save > "$after_first"
+
+    printf '1\ny\ny\ntcp 22\ndone\n0\n' | timeout 15 fwknopd \
+      --fw-console \
+      -c /etc/fwknop/fwknopd.conf \
+      -a /etc/fwknop/access.conf >> "$out"
     iptables-save > "$after"
 
     write_non_input_filter_rules "$prepared" "$before_non_input"
@@ -322,16 +398,79 @@ verify_fw_console_input_merge() {
     files_equal "$before_non_input" "$after_non_input" \
       || fail "fw-console initialize changed non-INPUT filter rules"
 
-    grep -Eq "^-A INPUT -p tcp( -m tcp)? --dport 2222 -j ACCEPT$" "$after" \
-      || fail "fw-console initialize did not preserve existing INPUT tcp/2222 rule"
-    grep -q "^-A INPUT -j ${chain}$" "$after" \
-      || fail "fw-console initialize did not preserve existing INPUT jump rule"
+    ! grep -Eq "^-A INPUT -p tcp( -m tcp)? --dport 2222 -j ACCEPT$" "$after" \
+      || fail "fw-console initialize preserved old INPUT tcp/2222 rule"
+    ! grep -q "^-A INPUT -j ${chain}$" "$after" \
+      || fail "fw-console initialize preserved old INPUT jump rule"
     grep -q "^-A ${chain} -j RETURN$" "$after" \
       || fail "fw-console initialize did not preserve custom chain rules"
+    grep -q "^-A FORWARD -j ${chain}$" "$after" \
+      || fail "fw-console initialize did not preserve non-INPUT jump rule"
     grep -Eq "^-A INPUT -p udp( -m udp)? --dport ${VERIFY_KNOCK_PORT} -j ACCEPT$" "$after" \
       || fail "fw-console initialize did not add fwknop UDP server port"
+    grep -q "^-A INPUT -j FWKNOP_INPUT$" "$after" \
+      || fail "fw-console initialize did not keep the FWKNOP_INPUT jump"
+
+    count="$(count_matching_rules "^-A INPUT " "$after")"
+    [ "$count" = "6" ] || fail "fw-console initialize left unexpected INPUT rule count"
+    count="$(count_matching_rules "^-A INPUT -i lo -j ACCEPT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize left duplicate loopback rules"
+    count="$(count_matching_rules "^-A INPUT -p tcp( -m tcp)? --dport 22 -j ACCEPT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize left duplicate tcp/22 rules"
+    count="$(count_matching_rules "^-A INPUT -p udp( -m udp)? --dport ${VERIFY_KNOCK_PORT} -j ACCEPT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize left duplicate fwknop UDP server rules"
+    count="$(count_matching_rules "^-A INPUT -j FWKNOP_INPUT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize left duplicate FWKNOP_INPUT jumps"
+    count="$(count_matching_rules "^-A INPUT .*--state (ESTABLISHED,RELATED|RELATED,ESTABLISHED).* -j ACCEPT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize left duplicate established-state rules"
+    count="$(count_matching_rules "^-A INPUT -p icmp -j ACCEPT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize left duplicate icmp rules"
+
     grep -q 'Firewall INPUT chain initialized successfully' "$out" \
       || fail "fw-console initialize did not report INPUT-only initialization"
+  )
+}
+
+verify_fw_console_ssh_fallback() {
+  local backup prepared after out count
+
+  if ! iptables_capable; then
+    log "iptables modification is unavailable; skipping fw-console SSH fallback check"
+    return 0
+  fi
+
+  log "checking fwknopd --fw-console keeps SSH open on initialize"
+  backup="$(mktemp /tmp/portguard-fw-before.XXXXXX)"
+  prepared="$(mktemp /tmp/portguard-fw-prepared.XXXXXX)"
+  after="$(mktemp /tmp/portguard-fw-after.XXXXXX)"
+  out="$(mktemp /tmp/portguard-fw-console.XXXXXX)"
+
+  iptables-save > "$backup"
+  (
+    trap 'iptables-restore < "$backup" >/dev/null 2>&1 || true; rm -f "$backup" "$prepared" "$after" "$out"' EXIT
+
+    iptables -F INPUT
+    iptables -P INPUT ACCEPT
+    iptables-save > "$prepared"
+
+    printf '1\ny\nn\n0\n' | SSH_CONNECTION='203.0.113.10 49152 198.51.100.20 2222' timeout 15 fwknopd \
+      --fw-console \
+      -c /etc/fwknop/fwknopd.conf \
+      -a /etc/fwknop/access.conf > "$out"
+    iptables-save > "$after"
+
+    grep -q '^:INPUT DROP ' "$after" \
+      || fail "fw-console initialize did not change INPUT policy to DROP"
+    count="$(count_matching_rules "^-A INPUT -p tcp( -m tcp)? --dport 22 -j ACCEPT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize did not keep tcp/22 open exactly once"
+    count="$(count_matching_rules "^-A INPUT -p tcp( -m tcp)? --dport 2222 -j ACCEPT$" "$after")"
+    [ "$count" = "1" ] || fail "fw-console initialize did not keep detected SSH tcp/2222 open exactly once"
+    grep -Eq "^-A INPUT -p udp( -m udp)? --dport ${VERIFY_KNOCK_PORT} -j ACCEPT$" "$after" \
+      || fail "fw-console initialize did not add fwknop UDP server port"
+    grep -q 'The SSH fallback port tcp/22 will be kept open to avoid lockout' "$out" \
+      || fail "fw-console initialize did not report tcp/22 SSH fallback"
+    grep -q 'Detected current SSH server port tcp/2222; it will be kept open' "$out" \
+      || fail "fw-console initialize did not report detected SSH server port"
   )
 }
 
@@ -380,9 +519,11 @@ main() {
   family="$(os_family)"
   install_package "$family"
   verify_installed_files
+  verify_first_start_key_initialization
   verify_fwknopd
   verify_fw_console_persistence "$family"
-  verify_fw_console_input_merge
+  verify_fw_console_ssh_fallback
+  verify_fw_console_input_rebuild
   log "PASS ${PACKAGE_FILE}"
 }
 

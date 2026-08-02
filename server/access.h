@@ -50,6 +50,8 @@
 */
 #define MAX_DEPTH 3
 
+#define PORTGUARD_KEY_PLACEHOLDER "__PORTGUARD_GENERATE_ON_FIRST_START__"
+
 /* Function Prototypes
 */
 
@@ -81,6 +83,19 @@ int parse_access_file(fko_srv_options_t *opts, char *access_filename, int *depth
  *
  */
 int parse_access_folder(fko_srv_options_t *opts, char *access_folder, int *depth);
+
+/**
+ * \brief Replaces the packaged first-start key placeholders with random keys
+ *
+ * The access file is left unchanged unless it contains exactly one
+ * KEY_BASE64 and one HMAC_KEY_BASE64 entry, both set to the PortGuard
+ * first-start placeholder.
+ *
+ * \param access_filename Pointer to the access.conf file to initialize
+ *
+ * \return EXIT_SUCCESS when unchanged or initialized, otherwise EXIT_FAILURE
+ */
+int initialize_access_file_keys(const char *access_filename);
 
 /**
  * \brief Basic validation for a access stanzas
