@@ -176,13 +176,25 @@ expected_version_banner() {
 
 verify_version_banner() {
   local family="$1"
-  local expected actual
+  local expected actual help_header help_output
 
   expected="$(expected_version_banner "$family")"
   actual="$(fwknopd -V)"
   log "checking fwknopd version banner: ${expected}"
   [ "$actual" = "$expected" ] \
     || fail "fwknopd -V returned '${actual}', expected '${expected}'"
+
+  help_output="$(fwknopd --help)"
+  help_header="$(printf '%s\n' "$help_output" | awk 'NF {print; exit}')"
+  log "checking fwknopd --help header"
+  [ "$help_header" = "$expected" ] \
+    || fail "fwknopd --help returned header '${help_header}', expected '${expected}'"
+  printf '%s\n' "$help_output" | grep -Fq \
+    'Single Packet Authorization server - https://portguard.net' \
+    || fail "fwknopd --help did not show https://portguard.net"
+  if printf '%s\n' "$help_output" | grep -Fq 'cipherdyne.org/fwknop'; then
+    fail "fwknopd --help still references cipherdyne.org/fwknop"
+  fi
 }
 
 extract_key_field() {
@@ -362,6 +374,13 @@ EOF
 
   grep -q 'Telegram test notification sent successfully' /tmp/fwknopd-tg-console.out \
     || fail "fw-console Telegram test notification did not succeed"
+  grep -q '@BotFather' /tmp/fwknopd-tg-console.out \
+    || fail "fw-console did not explain how to obtain a Telegram bot token"
+  grep -q 'bot<BOT_TOKEN>/getUpdates' /tmp/fwknopd-tg-console.out \
+    || fail "fw-console did not explain how to obtain a Telegram chat ID"
+  grep -q 'https://portguard.net/docs/get-started/telegram-notifications' \
+    /tmp/fwknopd-tg-console.out \
+    || fail "fw-console did not show the Telegram configuration guide"
   grep -q "^PORTGUARD_TG_BOT_TOKEN[[:space:]]*${token};$" /etc/fwknop/fwknopd.conf \
     || fail "fw-console did not persist the Telegram bot token"
   grep -q "^PORTGUARD_TG_CHAT_ID[[:space:]]*${chat_id};$" /etc/fwknop/fwknopd.conf \

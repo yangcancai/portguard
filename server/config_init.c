@@ -1530,8 +1530,13 @@ dump_config(const fko_srv_options_t *opts)
 void
 usage(void)
 {
-    fprintf(stdout, "\n%s server version %s\n%s - http://www.cipherdyne.org/fwknop/\n\n",
+#ifdef PORTGUARD_PACKAGE_RELEASE
+    fprintf(stdout, "\n%s\n%s - https://portguard.net\n\n",
+            PORTGUARD_SERVER_VERSION, MY_DESC);
+#else
+    fprintf(stdout, "\n%s server version %s\n%s - https://portguard.net\n\n",
             MY_NAME, MY_VERSION, MY_DESC);
+#endif
     fprintf(stdout,
       "Usage: fwknopd [options]\n\n"
       " -a, --access-file       - Specify an alternate access.conf file.\n"

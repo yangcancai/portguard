@@ -500,6 +500,11 @@ telegram_configure_console(fko_srv_options_t *opts)
     printf("\nTelegram Notifications\n");
     printf("======================\n");
     printf("Status: %s\n", enabled ? "configured" : "disabled");
+    printf("Bot token: message @BotFather, send /newbot, and copy the token.\n");
+    printf("Chat ID: message the bot, then read message.chat.id from:\n");
+    printf("https://api.telegram.org/bot<BOT_TOKEN>/getUpdates\n");
+    printf("Keep the bot token secret. Detailed guide:\n");
+    printf("https://portguard.net/docs/get-started/telegram-notifications\n");
     printf("Enter 'disable' as the bot token to disable notifications.\n");
     printf("Bot token%s: ", enabled ? " (press Enter to keep current)" : "");
     if(!read_console_secret(token, sizeof(token)))
