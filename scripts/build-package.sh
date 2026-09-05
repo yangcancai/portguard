@@ -300,7 +300,8 @@ build_install_root() {
       --enable-udp-server \
       --without-gpgme \
       --with-iptables="$iptables_bin" \
-      --with-firewalld=no
+      --with-firewalld=no \
+      --with-portguard-release="$PACKAGE_RELEASE"
     jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
     make -j "$jobs"
     make install DESTDIR="$install_root"
@@ -375,7 +376,7 @@ Section: net
 Priority: optional
 Architecture: ${arch}
 Maintainer: PortGuard Maintainers <support@portguard.net>
-Depends: libc6 (>= 2.17), iptables
+Depends: libc6 (>= 2.17), iptables, curl, ca-certificates
 Recommends: qrencode
 Conflicts: fwknop-server, libfko, libfko3
 Replaces: fwknop-server, libfko, libfko3
@@ -428,7 +429,7 @@ Release: ${PACKAGE_RELEASE}.${DISTRO}%{?dist}
 Summary: PortGuard Single Packet Authorization server
 License: GPL-2.0-or-later
 URL: https://portguard.net/
-Requires: iptables
+Requires: iptables, curl, ca-certificates
 Conflicts: fwknop-server, libfko
 
 %description

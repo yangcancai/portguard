@@ -37,6 +37,7 @@
 #include "log_msg.h"
 #include "extcmd.h"
 #include "access.h"
+#include "telegram_notify.h"
 
 static struct fw_config fwc;
 static char   cmd_buf[CMD_BUFSIZE];
@@ -57,6 +58,17 @@ zero_cmd_buffers(void)
 }
 
 static int pid_status = 0;
+
+static unsigned int
+active_rule_count(const fko_srv_options_t * const opts)
+{
+    unsigned int count = 0;
+    int i;
+
+    for(i = 0; i < NUM_FWKNOP_ACCESS_TYPES; i++)
+        count += opts->fw_config->chain[i].active_rules;
+    return count;
+}
 
 static int
 rule_exists_no_chk_support(const fko_srv_options_t * const opts,
@@ -1499,6 +1511,7 @@ process_spa_request(const fko_srv_options_t * const opts,
     int             str_len;
     time_t          now;
     unsigned int    exp_ts;
+    unsigned int    rules_before = active_rule_count(opts);
 
     if(access_any && (acc->force_nat
             || spadat->message_type == FKO_LOCAL_NAT_ACCESS_MSG
@@ -1696,6 +1709,9 @@ process_spa_request(const fko_srv_options_t * const opts,
     /* Done with the port list for access rules.
     */
     free_acc_port_list(port_list);
+
+    if(active_rule_count(opts) > rules_before)
+        telegram_notify_access(opts, spadat, now, exp_ts);
 
     return(res);
 }
@@ -2734,6 +2750,7 @@ void show_menu() {
     printf("2. List current rules\n");
     printf("3. Add port rule\n");
     printf("4. Delete rule\n");
+    printf("5. Configure Telegram notifications\n");
     printf("0. Exit\n");
     printf("====================\n");
     printf("Select option: ");
@@ -2762,6 +2779,10 @@ int firewall_cmds(fko_srv_options_t * const opts) {
                 break;
             case 4:
                 delete_rule();
+                break;
+            case 5:
+                while(getchar() != '\n' && !feof(stdin));
+                telegram_configure_console(opts);
                 break;
             case 0:
                 printf("Exiting...\n");

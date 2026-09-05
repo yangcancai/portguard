@@ -19,8 +19,8 @@ Usage:
 
 The verifier installs the local .deb/.rpm, checks first-start key generation,
 writes a temporary fwknopd config, checks parser/QR behavior, verifies dynamic
-libraries, and checks fw-console firewall persistence/rebuild behavior when
-iptables is usable.
+libraries, checks Telegram console configuration/token handling, and checks
+fw-console firewall persistence/rebuild behavior when iptables is usable.
 USAGE
 }
 
@@ -152,6 +152,37 @@ assert_file() {
 
 assert_executable() {
   [ -x "$1" ] || fail "missing executable: $1"
+}
+
+expected_version_banner() {
+  local family="$1"
+  local version release
+
+  case "$family" in
+    debian)
+      version="$(dpkg-deb -f "$PACKAGE_FILE" Version)"
+      release="${version#*+}"
+      version="${version%%+*}"
+      ;;
+    rhel)
+      version="$(rpm -qp --queryformat '%{VERSION}' "$PACKAGE_FILE")"
+      release="$(rpm -qp --queryformat '%{RELEASE}' "$PACKAGE_FILE")"
+      release="${release%%.*}"
+      ;;
+  esac
+
+  printf 'portguard-server_%s+%s\n' "$version" "$release"
+}
+
+verify_version_banner() {
+  local family="$1"
+  local expected actual
+
+  expected="$(expected_version_banner "$family")"
+  actual="$(fwknopd -V)"
+  log "checking fwknopd version banner: ${expected}"
+  [ "$actual" = "$expected" ] \
+    || fail "fwknopd -V returned '${actual}', expected '${expected}'"
 }
 
 extract_key_field() {
@@ -305,6 +336,67 @@ verify_fwknopd() {
     ldd /usr/sbin/fwknopd | tee /tmp/fwknopd-ldd.out
     ! grep -q 'not found' /tmp/fwknopd-ldd.out || fail "fwknopd has missing shared libraries"
   fi
+}
+
+verify_telegram_console() {
+  local mock_dir token chat_id
+
+  mock_dir="$(mktemp -d /tmp/portguard-tg-mock.XXXXXX)"
+  token="123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+  chat_id="-1001234567890"
+
+  cat > "${mock_dir}/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > /tmp/portguard-tg-curl.args
+cat > /tmp/portguard-tg-curl.config
+exit 0
+EOF
+  chmod 0755 "${mock_dir}/curl"
+
+  log "checking fwknopd --fw-console Telegram configuration"
+  printf '5\n%s\n%s\n300\ny\ny\n0\n' "$token" "$chat_id" \
+    | env PATH="${mock_dir}:${PATH}" fwknopd \
+        --fw-console \
+        -c /etc/fwknop/fwknopd.conf \
+        -a /etc/fwknop/access.conf > /tmp/fwknopd-tg-console.out
+
+  grep -q 'Telegram test notification sent successfully' /tmp/fwknopd-tg-console.out \
+    || fail "fw-console Telegram test notification did not succeed"
+  grep -q "^PORTGUARD_TG_BOT_TOKEN[[:space:]]*${token};$" /etc/fwknop/fwknopd.conf \
+    || fail "fw-console did not persist the Telegram bot token"
+  grep -q "^PORTGUARD_TG_CHAT_ID[[:space:]]*${chat_id};$" /etc/fwknop/fwknopd.conf \
+    || fail "fw-console did not persist the Telegram chat ID"
+  grep -q '^PORTGUARD_TG_NOTIFY_INTERVAL[[:space:]]*300;$' /etc/fwknop/fwknopd.conf \
+    || fail "fw-console did not persist the Telegram notification interval"
+  [ "$(stat -c '%a' /etc/fwknop/fwknopd.conf)" = "600" ] \
+    || fail "fw-console did not keep fwknopd.conf mode 600"
+
+  [ "$(cat /tmp/portguard-tg-curl.args)" = $'--config\n-' ] \
+    || fail "Telegram sender passed unexpected curl command-line arguments"
+  ! grep -q "$token" /tmp/portguard-tg-curl.args \
+    || fail "Telegram bot token leaked into curl command-line arguments"
+  grep -q "url = \"https://api.telegram.org/bot${token}/sendMessage\"" \
+    /tmp/portguard-tg-curl.config \
+    || fail "Telegram sender did not target the Bot API sendMessage method"
+  grep -q 'data = "chat_id=-1001234567890&text=PortGuard%20Telegram' \
+    /tmp/portguard-tg-curl.config \
+    || fail "Telegram sender did not URL-encode the notification payload"
+
+  fwknopd \
+    --dump-config \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf > /tmp/fwknopd-tg-dump.out
+  grep -q "PORTGUARD_TG_BOT_TOKEN.*<redacted>" /tmp/fwknopd-tg-dump.out \
+    || fail "fwknopd config dump did not redact the Telegram bot token"
+  ! grep -q "$token" /tmp/fwknopd-tg-dump.out \
+    || fail "fwknopd config dump exposed the Telegram bot token"
+
+  fwknopd \
+    --exit-parse-config \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf
+
+  write_verify_config
 }
 
 iptables_capable() {
@@ -519,8 +611,10 @@ main() {
   family="$(os_family)"
   install_package "$family"
   verify_installed_files
+  verify_version_banner "$family"
   verify_first_start_key_initialization
   verify_fwknopd
+  verify_telegram_console
   verify_fw_console_persistence "$family"
   verify_fw_console_ssh_fallback
   verify_fw_console_input_rebuild

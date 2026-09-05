@@ -34,6 +34,7 @@
 #include "cmd_opts.h"
 #include "utils.h"
 #include "log_msg.h"
+#include "telegram_notify.h"
 
 #if FIREWALL_FIREWALLD
   #include "fw_util_firewalld.h"
@@ -1009,6 +1010,28 @@ validate_options(fko_srv_options_t *opts)
     if(opts->config[CONF_SYSLOG_FACILITY] == NULL)
         set_config_entry(opts, CONF_SYSLOG_FACILITY, DEF_SYSLOG_FACILITY);
 
+    if(opts->config[CONF_PORTGUARD_TG_NOTIFY_INTERVAL] == NULL)
+        set_config_entry(opts, CONF_PORTGUARD_TG_NOTIFY_INTERVAL,
+                DEF_PORTGUARD_TG_NOTIFY_INTERVAL);
+
+    range_check(opts, "PORTGUARD_TG_NOTIFY_INTERVAL",
+            opts->config[CONF_PORTGUARD_TG_NOTIFY_INTERVAL], 0,
+            RCHK_MAX_TG_NOTIFY_INTERVAL);
+
+    if((opts->config[CONF_PORTGUARD_TG_BOT_TOKEN] == NULL)
+            != (opts->config[CONF_PORTGUARD_TG_CHAT_ID] == NULL))
+    {
+        log_msg(LOG_ERR, "PORTGUARD_TG_BOT_TOKEN and PORTGUARD_TG_CHAT_ID must be configured together");
+        clean_exit(opts, NO_FW_CLEANUP, EXIT_FAILURE);
+    }
+    if(opts->config[CONF_PORTGUARD_TG_BOT_TOKEN] != NULL
+            && (!telegram_bot_token_is_valid(opts->config[CONF_PORTGUARD_TG_BOT_TOKEN])
+                || !telegram_chat_id_is_valid(opts->config[CONF_PORTGUARD_TG_CHAT_ID])))
+    {
+        log_msg(LOG_ERR, "Invalid PortGuard Telegram bot token or chat ID");
+        clean_exit(opts, NO_FW_CLEANUP, EXIT_FAILURE);
+    }
+
 
     /* Validate integer variable ranges
     */
@@ -1098,8 +1121,12 @@ config_init(fko_srv_options_t *opts, int argc, char **argv)
 
         switch(cmd_arg) {
             case 'V':
+#ifdef PORTGUARD_PACKAGE_RELEASE
+                fprintf(stdout, "%s\n", PORTGUARD_SERVER_VERSION);
+#else
                 fprintf(stdout, "fwknopd server %s, compiled for firewall bin: %s\n",
                         MY_VERSION, FIREWALL_EXE);
+#endif
                 clean_exit(opts, NO_FW_CLEANUP, EXIT_SUCCESS);
             case 'k':
                 opts->key_gen = 1;
@@ -1489,7 +1516,9 @@ dump_config(const fko_srv_options_t *opts)
         fprintf(stdout, "%3i. %-28s =  '%s'\n",
             i,
             config_map[i],
-            (opts->config[i] == NULL) ? "<not set>" : opts->config[i]
+            (i == CONF_PORTGUARD_TG_BOT_TOKEN && opts->config[i] != NULL)
+                ? "<redacted>"
+                : ((opts->config[i] == NULL) ? "<not set>" : opts->config[i])
         );
 
     fprintf(stdout, "\n");

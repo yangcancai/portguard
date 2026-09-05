@@ -18,6 +18,7 @@ define Package/portguard-server
   URL:=https://portguard.net/
   MAINTAINER:=PortGuard Maintainers <support@portguard.net>
   CONFLICTS:=fwknop fwknopd
+  DEPENDS:=+iptables +curl +ca-bundle
 endef
 
 define Package/portguard-server/description
@@ -39,7 +40,8 @@ CONFIGURE_ARGS += \
 	--enable-udp-server \
 	--without-gpgme \
 	--with-iptables=/usr/sbin/iptables \
-	--with-firewalld=no
+	--with-firewalld=no \
+	--with-portguard-release=$(PKG_RELEASE)
 
 define Build/Prepare
 	rm -rf $(PKG_BUILD_DIR)

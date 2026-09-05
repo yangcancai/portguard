@@ -53,6 +53,10 @@
 */
 #define MY_VERSION VERSION
 
+#ifdef PORTGUARD_PACKAGE_RELEASE
+  #define PORTGUARD_SERVER_VERSION "portguard-server_" VERSION "+" PORTGUARD_PACKAGE_RELEASE
+#endif
+
 /* Some program defaults.
 */
 #ifndef DEF_CONF_DIR
@@ -131,6 +135,7 @@
 #define DEF_SYSLOG_IDENTITY             MY_NAME
 #define DEF_SYSLOG_FACILITY             "LOG_DAEMON"
 #define DEF_ENABLE_DESTINATION_RULE     "N"
+#define DEF_PORTGUARD_TG_NOTIFY_INTERVAL "0"
 
 #define DEF_FW_ACCESS_TIMEOUT           30
 #define DEF_MAX_FW_TIMEOUT              300
@@ -148,6 +153,7 @@
 #define RCHK_MAX_CMD_CYCLE_TIMER        (2 << 22) /* seconds */
 #define RCHK_MIN_CMD_CYCLE_TIMER        1
 #define RCHK_MAX_RULES_CHECK_THRESHOLD  ((2 << 16) - 1)
+#define RCHK_MAX_TG_NOTIFY_INTERVAL     31536000 /* one year, in seconds */
 
 /* FirewallD-specific defines
 */
@@ -353,6 +359,9 @@ enum {
     CONF_PORTGUARD_CLIENT_SERVER,
     CONF_PORTGUARD_SECTION_NAME,
     CONF_PORTGUARD_ALLOW_IP,
+    CONF_PORTGUARD_TG_BOT_TOKEN,
+    CONF_PORTGUARD_TG_CHAT_ID,
+    CONF_PORTGUARD_TG_NOTIFY_INTERVAL,
     CONF_FAULT_INJECTION_TAG,
 
     NUMBER_OF_CONFIG_ENTRIES  /* Marks the end and number of entries */

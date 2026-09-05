@@ -17,6 +17,9 @@ EXIT_AFTER_READY="${PORTGUARD_FWTEST_EXIT_AFTER_READY:-0}"
 SHELL_AFTER_READY="${PORTGUARD_FWTEST_SHELL_AFTER_READY:-1}"
 OPEN_TEST_PORT_ON_INIT="${PORTGUARD_FWTEST_OPEN_TEST_PORT_ON_INIT:-0}"
 AUTO_KNOCK="${PORTGUARD_FWTEST_AUTO_KNOCK:-0}"
+TELEGRAM_MOCK="${PORTGUARD_FWTEST_TELEGRAM_MOCK:-0}"
+TELEGRAM_TOKEN="123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+TELEGRAM_CHAT_ID="-1001234567890"
 
 log() {
   printf '[portguard-fwtest] %s\n' "$*"
@@ -124,6 +127,14 @@ PORTGUARD_SECTION_NAME      ${SECTION_NAME};
 PORTGUARD_ALLOW_IP          ${CLIENT_TEST_IP};
 EOF
 
+  if [ "$TELEGRAM_MOCK" = "1" ]; then
+    cat >> /etc/fwknop/fwknopd.conf <<EOF
+PORTGUARD_TG_BOT_TOKEN       ${TELEGRAM_TOKEN};
+PORTGUARD_TG_CHAT_ID          ${TELEGRAM_CHAT_ID};
+PORTGUARD_TG_NOTIFY_INTERVAL  0;
+EOF
+  fi
+
   cat > /etc/fwknop/access.conf <<EOF
 SOURCE                      ANY
 OPEN_PORTS                  ANY
@@ -158,6 +169,22 @@ EOF
     --exit-parse-config \
     -c /etc/fwknop/fwknopd.conf \
     -a /etc/fwknop/access.conf
+}
+
+write_telegram_mock() {
+  if [ "$TELEGRAM_MOCK" != "1" ]; then
+    return
+  fi
+
+  log "writing Telegram curl mock"
+  mkdir -p /usr/local/lib/portguard-fwtest/mock-bin
+  cat > /usr/local/lib/portguard-fwtest/mock-bin/curl <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > /tmp/portguard-fwtest-tg.args
+cat > /tmp/portguard-fwtest-tg.request
+exit 0
+EOF
+  chmod 0755 /usr/local/lib/portguard-fwtest/mock-bin/curl
 }
 
 write_fwknopd_wrapper() {
@@ -336,9 +363,14 @@ verify_firewall() {
 start_fwknopd() {
   local access_file="${1:-/etc/fwknop/access.conf}"
   local log_file="${2:-/tmp/fwknopd.log}"
+  local daemon_path="$PATH"
+
+  if [ "$TELEGRAM_MOCK" = "1" ]; then
+    daemon_path="/usr/local/lib/portguard-fwtest/mock-bin:${daemon_path}"
+  fi
 
   log "starting fwknopd in UDP server mode with ${access_file}"
-  /usr/sbin/fwknopd \
+  PATH="$daemon_path" /usr/sbin/fwknopd \
     -f \
     -c /etc/fwknop/fwknopd.conf \
     -a "$access_file" > "$log_file" 2>&1 &
@@ -395,6 +427,26 @@ auto_knock_if_requested() {
   fi
   pg-fwtest-probe \
     || die "tcp/${TEST_PORT} is not reachable after ACCESS ANY knock"
+
+  if [ "$TELEGRAM_MOCK" = "1" ]; then
+    for _ in 1 2 3 4 5; do
+      [ -s /tmp/portguard-fwtest-tg.request ] && break
+      sleep 1
+    done
+    [ -s /tmp/portguard-fwtest-tg.request ] \
+      || die "successful SPA knock did not trigger a Telegram notification"
+    [ "$(cat /tmp/portguard-fwtest-tg.args)" = $'--config\n-' ] \
+      || die "Telegram bot token was exposed in curl arguments"
+    grep -q 'text=PortGuard%20access%20granted' /tmp/portguard-fwtest-tg.request \
+      || die "Telegram notification is missing the access-granted event"
+    grep -q 'Source%20IP%3A%2010.77.0.2' /tmp/portguard-fwtest-tg.request \
+      || die "Telegram notification is missing the allowed source IP"
+    grep -q 'Access%3A%20ANY' /tmp/portguard-fwtest-tg.request \
+      || die "Telegram notification is missing the requested access"
+    grep -q 'Expires%20at%3A%20' /tmp/portguard-fwtest-tg.request \
+      || die "Telegram notification is missing the expiration time"
+    log "Telegram notification triggered after successful SPA rule creation"
+  fi
 }
 
 print_status() {
@@ -441,6 +493,7 @@ main() {
   stage_fwknop_client
   install_portguard
   write_test_config
+  write_telegram_mock
   write_fwknopd_wrapper
   write_manual_helpers
   start_test_listeners

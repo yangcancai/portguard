@@ -27,6 +27,20 @@ dnl AM_MAINTAINER_MODE
 
 AC_CONFIG_HEADERS([config.h])
 
+AC_ARG_WITH([portguard-release],
+    [AS_HELP_STRING([--with-portguard-release=RELEASE],
+        [compile the PortGuard package release suffix into fwknopd])],
+    [portguard_release="$withval"],
+    [portguard_release=""])
+
+AS_IF([test "x$portguard_release" != "x" && test "x$portguard_release" != "xno"], [
+    AS_CASE([$portguard_release],
+        [*[[!A-Za-z0-9+._-]]*],
+        [AC_MSG_ERROR([invalid PortGuard release suffix: $portguard_release])])
+    AC_DEFINE_UNQUOTED([PORTGUARD_PACKAGE_RELEASE], ["$portguard_release"],
+        [PortGuard package release suffix])
+])
+
 dnl The top of our header
 dnl
 AH_TOP([
