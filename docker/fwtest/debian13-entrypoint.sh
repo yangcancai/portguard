@@ -127,14 +127,6 @@ PORTGUARD_SECTION_NAME      ${SECTION_NAME};
 PORTGUARD_ALLOW_IP          ${CLIENT_TEST_IP};
 EOF
 
-  if [ "$TELEGRAM_MOCK" = "1" ]; then
-    cat >> /etc/fwknop/fwknopd.conf <<EOF
-PORTGUARD_TG_BOT_TOKEN       ${TELEGRAM_TOKEN};
-PORTGUARD_TG_CHAT_ID          ${TELEGRAM_CHAT_ID};
-PORTGUARD_TG_NOTIFY_INTERVAL  0;
-EOF
-  fi
-
   cat > /etc/fwknop/access.conf <<EOF
 SOURCE                      ANY
 OPEN_PORTS                  ANY
@@ -383,6 +375,52 @@ start_fwknopd() {
   fi
 }
 
+configure_telegram_for_running_daemon() {
+  local pid
+
+  if [ "$TELEGRAM_MOCK" != "1" ]; then
+    return
+  fi
+
+  log "configuring Telegram after fwknopd has started"
+  printf '5\n%s\n%s\n0\ny\nn\n0\n' \
+    "$TELEGRAM_TOKEN" "$TELEGRAM_CHAT_ID" \
+    | PATH="/usr/local/lib/portguard-fwtest/mock-bin:$PATH" \
+      /usr/sbin/fwknopd \
+        --fw-console \
+        -c /etc/fwknop/fwknopd.conf \
+        -a /etc/fwknop/access.conf \
+        > /tmp/portguard-fwtest-tg-console.out
+
+  grep -q 'Running fwknopd reloaded the Telegram configuration' \
+    /tmp/portguard-fwtest-tg-console.out \
+    || die "Telegram console configuration did not reload the running daemon"
+  grep -Eq '^PORTGUARD_TG_BOT_TOKEN[[:space:]]+'"${TELEGRAM_TOKEN}"';$' \
+    /etc/fwknop/fwknopd.conf \
+    || die "Telegram bot token was not saved"
+  grep -Eq '^PORTGUARD_TG_CHAT_ID[[:space:]]+'"${TELEGRAM_CHAT_ID}"';$' \
+    /etc/fwknop/fwknopd.conf \
+    || die "Telegram chat ID was not saved"
+  grep -Eq '^PORTGUARD_TG_NOTIFY_INTERVAL[[:space:]]+0;$' \
+    /etc/fwknop/fwknopd.conf \
+    || die "Telegram notification interval was not saved"
+
+  for _ in 1 2 3 4 5; do
+    grep -q 'Got SIGHUP. Re-reading configs.' /tmp/fwknopd.log && break
+    sleep 1
+  done
+  if grep -q 'Got SIGHUP. Re-reading configs.' /tmp/fwknopd.log; then
+    log "fwknopd processed the Telegram configuration reload"
+  else
+    log "SIGHUP reload was not emitted to the foreground log; verifying through the next SPA notification"
+  fi
+
+  pid="$(cat /run/fwknop/fwknopd-fwtest.pid)"
+  kill -0 "$pid" >/dev/null 2>&1 \
+    || die "fwknopd stopped after reloading the Telegram configuration"
+  rm -f /tmp/portguard-fwtest-tg.args /tmp/portguard-fwtest-tg.request
+}
+
 stop_fwknopd() {
   local pid
 
@@ -433,8 +471,11 @@ auto_knock_if_requested() {
       [ -s /tmp/portguard-fwtest-tg.request ] && break
       sleep 1
     done
-    [ -s /tmp/portguard-fwtest-tg.request ] \
-      || die "successful SPA knock did not trigger a Telegram notification"
+    if [ ! -s /tmp/portguard-fwtest-tg.request ]; then
+      cat /tmp/portguard-fwtest-tg-console.out >&2 || true
+      cat /tmp/fwknopd.log >&2 || true
+      die "successful SPA knock did not trigger a Telegram notification"
+    fi
     [ "$(cat /tmp/portguard-fwtest-tg.args)" = $'--config\n-' ] \
       || die "Telegram bot token was exposed in curl arguments"
     grep -q 'text=PortGuard%20access%20granted' /tmp/portguard-fwtest-tg.request \
@@ -502,6 +543,7 @@ main() {
   verify_firewall
   verify_any_requires_explicit_authorization
   start_fwknopd
+  configure_telegram_for_running_daemon
   auto_knock_if_requested
   print_status
   if [ "$EXIT_AFTER_READY" = "1" ]; then

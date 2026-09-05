@@ -5,6 +5,7 @@
  */
 
 #include "fwknopd_common.h"
+#include "fwknopd.h"
 #include "telegram_notify.h"
 #include "log_msg.h"
 
@@ -315,13 +316,32 @@ telegram_notify_access(const fko_srv_options_t *opts,
         signal(SIGCHLD, SIG_DFL);
         sent = send_message(opts->config[CONF_PORTGUARD_TG_BOT_TOKEN],
                 opts->config[CONF_PORTGUARD_TG_CHAT_ID], message);
-        if(!sent)
+        if(sent)
+            log_msg(LOG_INFO, "Telegram access notification sent for %s",
+                    spadat->use_src_ip == NULL ? "unknown" : spadat->use_src_ip);
+        else
             log_msg(LOG_WARNING, "Could not send Telegram access notification");
         _exit(sent ? EXIT_SUCCESS : EXIT_FAILURE);
     }
     if(pid < 0)
         log_msg(LOG_WARNING, "Could not fork Telegram notification worker: %s",
                 strerror(errno));
+    else
+        log_msg(LOG_INFO,
+                "Queued Telegram access notification for %s (%s), expires at %u",
+                spadat->use_src_ip == NULL ? "unknown" : spadat->use_src_ip,
+                spadat->spa_message_remain[0] == '\0'
+                    ? "unknown" : spadat->spa_message_remain,
+                (unsigned int)expires_at);
+}
+
+static void
+reload_running_daemon(fko_srv_options_t *opts)
+{
+    if(restart_fwknopd(opts) == EXIT_SUCCESS)
+        printf("Running fwknopd reloaded the Telegram configuration.\n");
+    else
+        printf("No running fwknopd was reloaded; start or restart the service to apply the configuration.\n");
 }
 
 static int
@@ -501,7 +521,8 @@ telegram_configure_console(fko_srv_options_t *opts)
         replace_config_value(opts, CONF_PORTGUARD_TG_CHAT_ID, NULL);
         replace_config_value(opts, CONF_PORTGUARD_TG_NOTIFY_INTERVAL,
                 DEF_PORTGUARD_TG_NOTIFY_INTERVAL);
-        printf("Telegram notifications disabled. Restart fwknopd to apply.\n");
+        printf("Telegram notifications disabled.\n");
+        reload_running_daemon(opts);
         memset(token, 0, sizeof(token));
         return 1;
     }
@@ -560,7 +581,8 @@ telegram_configure_console(fko_srv_options_t *opts)
     replace_config_value(opts, CONF_PORTGUARD_TG_CHAT_ID, chat_id);
     snprintf(interval_text, sizeof(interval_text), "%lu", interval);
     replace_config_value(opts, CONF_PORTGUARD_TG_NOTIFY_INTERVAL, interval_text);
-    printf("Telegram configuration saved. Restart fwknopd to apply it.\n");
+    printf("Telegram configuration saved.\n");
+    reload_running_daemon(opts);
     printf("Send a test notification now? (y/n): ");
     if(read_console_line(answer, sizeof(answer))
             && (answer[0] == 'y' || answer[0] == 'Y'))

@@ -82,4 +82,6 @@
    */
 #define PID_BUFLEN 8
 
+int restart_fwknopd(fko_srv_options_t * const opts);
+
 #endif  /* FWKNOPD_H */

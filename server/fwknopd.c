@@ -54,7 +54,6 @@ static int stop_fwknopd(fko_srv_options_t * const opts);
 static int status_fwknopd(fko_srv_options_t * const opts);
 static int qr_fwknopd(fko_srv_options_t * const opts);
 static int fw_console(fko_srv_options_t * const opts);
-static int restart_fwknopd(fko_srv_options_t * const opts);
 static int write_pid_file(fko_srv_options_t *opts);
 static int handle_signals(fko_srv_options_t *opts);
 static void setup_pid(fko_srv_options_t *opts);
@@ -282,10 +281,18 @@ main(int argc, char **argv)
                 log_msg(LOG_ERR, "Fatal run_udp_server() error");
                 clean_exit(&opts, FW_CLEANUP, EXIT_FAILURE);
             }
-            else
+
+            /* UDP capture returns when a terminating or reload signal is
+             * pending. Handle it here before leaving the outer config loop.
+            */
+            if(got_signal != 0)
             {
-                break;
+                if(handle_signals(&opts) == 1)
+                    break;
+                continue;
             }
+
+            break;
         }
 
         /* If the TCP server option was set, fire it up here. Note that in
@@ -574,7 +581,7 @@ static void setup_pid(fko_srv_options_t *opts)
     return;
 }
 
-static int restart_fwknopd(fko_srv_options_t * const opts)
+int restart_fwknopd(fko_srv_options_t * const opts)
 {
     int      res = 0;
     pid_t    old_pid;

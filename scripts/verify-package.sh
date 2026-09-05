@@ -19,8 +19,8 @@ Usage:
 
 The verifier installs the local .deb/.rpm, checks first-start key generation,
 writes a temporary fwknopd config, checks parser/QR behavior, verifies dynamic
-libraries, checks Telegram console configuration/token handling, and checks
-fw-console firewall persistence/rebuild behavior when iptables is usable.
+libraries, checks UDP configuration reload and Telegram console handling, and
+checks fw-console firewall persistence/rebuild behavior when iptables is usable.
 USAGE
 }
 
@@ -399,6 +399,64 @@ EOF
   write_verify_config
 }
 
+verify_udp_reload() {
+  local daemon_pid recorded_pid
+
+  log "checking UDP server survives fwknopd -R configuration reload"
+  rm -f /run/fwknop/fwknopd.pid
+  fwknopd \
+    --foreground \
+    --test \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf > /tmp/fwknopd-reload.log 2>&1 &
+  daemon_pid="$!"
+  trap 'kill "$daemon_pid" >/dev/null 2>&1 || true' EXIT
+
+  for _ in 1 2 3 4 5; do
+    [ -s /run/fwknop/fwknopd.pid ] && break
+    sleep 1
+  done
+  [ -s /run/fwknop/fwknopd.pid ] \
+    || fail "UDP server did not create its PID file"
+  kill -0 "$daemon_pid" >/dev/null 2>&1 \
+    || fail "UDP server did not stay running before reload"
+
+  fwknopd \
+    --restart \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf > /tmp/fwknopd-restart.out
+  grep -q 'Sent restart signal to fwknopd' /tmp/fwknopd-restart.out \
+    || fail "fwknopd -R did not send the reload signal"
+
+  for _ in 1 2 3 4 5; do
+    grep -q 'Got SIGHUP. Re-reading configs.' /tmp/fwknopd-reload.log \
+      && break
+    sleep 1
+  done
+  grep -q 'Got SIGHUP. Re-reading configs.' /tmp/fwknopd-reload.log \
+    || fail "UDP server did not process the reload signal"
+
+  for _ in 1 2 3 4 5; do
+    [ "$(grep -c 'Kicking off UDP server' /tmp/fwknopd-reload.log || true)" -ge 2 ] \
+      && break
+    sleep 1
+  done
+  [ "$(grep -c 'Kicking off UDP server' /tmp/fwknopd-reload.log || true)" -ge 2 ] \
+    || fail "UDP server did not resume listening after configuration reload"
+  kill -0 "$daemon_pid" >/dev/null 2>&1 \
+    || fail "UDP server exited during configuration reload"
+  recorded_pid="$(tr -d '[:space:]' < /run/fwknop/fwknopd.pid)"
+  [ "$recorded_pid" = "$daemon_pid" ] \
+    || fail "UDP server PID changed during configuration reload"
+
+  kill "$daemon_pid"
+  wait "$daemon_pid" \
+    || fail "UDP server returned an error after SIGTERM"
+  ! kill -0 "$daemon_pid" >/dev/null 2>&1 \
+    || fail "UDP server did not stop after SIGTERM"
+  trap - EXIT
+}
+
 iptables_capable() {
   command -v iptables >/dev/null 2>&1 \
     && command -v iptables-save >/dev/null 2>&1 \
@@ -615,6 +673,7 @@ main() {
   verify_first_start_key_initialization
   verify_fwknopd
   verify_telegram_console
+  verify_udp_reload
   verify_fw_console_persistence "$family"
   verify_fw_console_ssh_fallback
   verify_fw_console_input_rebuild
