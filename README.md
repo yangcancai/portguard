@@ -2,6 +2,8 @@
 
 PortGuard Server is the server-side component of the PortGuard project.
 The official website is [https://portguard.net](https://portguard.net).
+See [CHANGELOG.md](CHANGELOG.md) for the server and client release history,
+version compatibility matrix, and detailed release notes.
 
 This repository is forked from the original `fwknop` project and modified for
 PortGuard. It keeps the core Single Packet Authorization (SPA) foundation from
