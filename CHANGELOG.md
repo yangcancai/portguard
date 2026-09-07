@@ -121,6 +121,30 @@ Recommended server: **fwknop 2.6.11 or any PortGuard Server pg release**.
 
 ## Server releases
 
+### PortGuard Server 2.6.11-pg8 - Unreleased
+
+Compatible client: **PortGuard Client 2.2.1 or later**.
+
+- Fixed `--fw-console` input handling so closed stdin and invalid menu input
+  exit or recover cleanly instead of repeatedly executing the previous action.
+- Added an explicit reboot-persistence menu option that saves IPv4 rules
+  atomically and enables a systemd restore service before `fwknopd` starts.
+- Excluded temporary SPA grant rules from reboot snapshots so time-limited
+  authorization cannot become permanent after a restart.
+
+### PortGuard Server 2.6.11-pg7 - 2026-09-05
+
+Compatible client: **PortGuard Client 2.2.1 or later**.
+
+- Added Telegram notifications for successful SPA firewall authorization,
+  including source IP, requested access, authorization time, and expiration.
+- Added Bot Token, Chat ID, notification interval, test-message, and disable
+  controls to `--fw-console`.
+- Updated the PortGuard version and help banners and added concise Telegram
+  setup guidance linking to the official documentation.
+
+[View v2.6.11-pg7 on GitHub](https://github.com/yangcancai/portguard/releases/tag/v2.6.11-pg7)
+
 ### PortGuard Server 2.6.11-pg6 - 2026-08-02
 
 Compatible client: **PortGuard Client 2.2.1** for explicit access rules and

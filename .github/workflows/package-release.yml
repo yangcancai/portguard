@@ -32,6 +32,9 @@ jobs:
           - distro: ubuntu2404
             image: ubuntu:24.04
             platform: linux/amd64
+          - distro: ubuntu2604
+            image: ubuntu:26.04
+            platform: linux/amd64
           - distro: centos7
             image: quay.io/centos/centos:7
             platform: linux/amd64

@@ -67,6 +67,7 @@ add_all_images() {
     debian:13
     ubuntu:22.04
     ubuntu:24.04
+    ubuntu:26.04
     rockylinux:8
     rockylinux:9
     quay.io/centos/centos:7

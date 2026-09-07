@@ -43,8 +43,10 @@ upstream fwknop foundation:
    release packages contain no working default keys and preserve configured
    keys on later starts and upgrades.
  * A firewall console mode (`fwknopd --fw-console`) for listing rules, adding
-   port rules, deleting rules, persisting rules on Debian/RHEL-family systems,
-   and rebuilding the `INPUT` chain while preserving other chains and tables.
+   port rules, deleting rules, and rebuilding the `INPUT` chain while preserving
+   other chains and tables. Its reboot-persistence option installs a systemd
+   restore service on Debian/RHEL-family systems and excludes temporary SPA
+   grants from the saved rules.
  * Systemd-ready server packaging that installs `fwknopd` and `libfko` together
    as the PortGuard Server package.
  * OpenWrt SDK-based package builds for router deployments.
@@ -102,6 +104,16 @@ pg-fwtest-knock
 pg-fwtest-check
 fwknopd -Q
 fwknopd --fw-console
+```
+
+Choose `6. Enable/update reboot persistence` after the firewall rules are ready.
+This writes the current IPv4 snapshot to `/etc/iptables/rules.v4` on Debian and
+Ubuntu, or `/etc/sysconfig/iptables` on RHEL-family systems, then enables
+`portguard-iptables-restore.service`. Verify it with:
+
+```bash
+systemctl is-enabled portguard-iptables-restore.service
+systemctl status portguard-iptables-restore.service
 ```
 
 The Debian 13 test container adds a local `fwknopd` convenience wrapper so

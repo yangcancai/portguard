@@ -1994,6 +1994,93 @@ validate_ipt_chain_conf(const char * const chain_str)
 #define MAX_RULE_LINE 4096
 #define TEMP_RULES_FILE "/tmp/iptables_temp.rules"
 #define BACKUP_RULES_FILE "/tmp/iptables_backup.rules"
+#define PORTGUARD_IPTABLES_SERVICE "portguard-iptables-restore.service"
+#define PORTGUARD_IPTABLES_UNIT "/etc/systemd/system/" PORTGUARD_IPTABLES_SERVICE
+
+static int read_firewall_console_line(char *buf, const size_t size) {
+    int ch;
+
+    fflush(stdout);
+    if (size < 2 || fgets(buf, size, stdin) == NULL)
+        return 0;
+
+    if (strchr(buf, '\n') == NULL && !feof(stdin)) {
+        while ((ch = getchar()) != '\n' && ch != EOF)
+            ;
+    }
+
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return 1;
+}
+
+static int read_firewall_console_char(char *value) {
+    char input[32];
+    char *cursor;
+
+    if (!read_firewall_console_line(input, sizeof(input)))
+        return 0;
+
+    cursor = input;
+    while (isspace((unsigned char) *cursor))
+        cursor++;
+    if (*cursor == '\0')
+        return -1;
+
+    *value = *cursor;
+    return 1;
+}
+
+static int read_firewall_console_word(char *value, const size_t size) {
+    char input[128];
+    char *cursor, *end;
+    size_t len;
+
+    if (!read_firewall_console_line(input, sizeof(input)))
+        return 0;
+
+    cursor = input;
+    while (isspace((unsigned char) *cursor))
+        cursor++;
+    end = cursor;
+    while (*end != '\0' && !isspace((unsigned char) *end))
+        end++;
+
+    len = (size_t) (end - cursor);
+    while (isspace((unsigned char) *end))
+        end++;
+    if (len == 0 || len >= size || *end != '\0')
+        return -1;
+
+    memcpy(value, cursor, len);
+    value[len] = '\0';
+    return 1;
+}
+
+static int read_firewall_console_int(int *value, const int min,
+        const int max) {
+    char input[64];
+    char *cursor, *endptr;
+    long parsed;
+
+    if (!read_firewall_console_line(input, sizeof(input)))
+        return 0;
+
+    cursor = input;
+    while (isspace((unsigned char) *cursor))
+        cursor++;
+
+    errno = 0;
+    parsed = strtol(cursor, &endptr, 10);
+    if (cursor == endptr || errno != 0)
+        return -1;
+    while (isspace((unsigned char) *endptr))
+        endptr++;
+    if (*endptr != '\0' || parsed < min || parsed > max)
+        return -1;
+
+    *value = (int) parsed;
+    return 1;
+}
 
 typedef struct input_rule_list {
     char *rule;
@@ -2445,39 +2532,248 @@ static int command_exists(const char *cmd) {
 }
 
 static int save_rules_to_path(const char *dir, const char *path) {
-    char cmd[MAX_CMD_LEN];
+    char cmd[MAX_CMD_LEN], line[MAX_RULE_LINE];
+    char raw_path[] = "/tmp/portguard-iptables-save.XXXXXX";
+    char temp_path[MAX_PATH_LEN];
+    FILE *source = NULL, *dest = NULL;
+    int raw_fd = -1, temp_fd = -1, rv = -1, skipped = 0;
 
     snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir);
     if (execute_cmd_status(cmd) != 0)
         return -1;
 
-    snprintf(cmd, sizeof(cmd), "iptables-save > %s", path);
-    return execute_cmd_status(cmd) == 0 ? 0 : -1;
+    if (snprintf(temp_path, sizeof(temp_path), "%s.portguard.XXXXXX", path)
+            >= (int) sizeof(temp_path))
+        return -1;
+
+    temp_fd = mkstemp(temp_path);
+    if (temp_fd < 0 || fchmod(temp_fd, S_IRUSR | S_IWUSR) != 0)
+        goto cleanup;
+
+    dest = fdopen(temp_fd, "w");
+    if (dest == NULL)
+        goto cleanup;
+    temp_fd = -1;
+
+    raw_fd = mkstemp(raw_path);
+    if (raw_fd < 0 || fchmod(raw_fd, S_IRUSR | S_IWUSR) != 0)
+        goto cleanup;
+    if (close(raw_fd) != 0)
+        goto cleanup;
+    raw_fd = -1;
+
+    snprintf(cmd, sizeof(cmd), "iptables-save > %s", raw_path);
+    if (execute_cmd_status(cmd) != 0)
+        goto cleanup;
+
+    printf("Saving active firewall rules to %s\n", path);
+    source = fopen(raw_path, "r");
+    if (source == NULL)
+        goto cleanup;
+
+    while (fgets(line, sizeof(line), source) != NULL) {
+        if (strstr(line, EXPIRE_COMMENT_PREFIX) != NULL) {
+            skipped++;
+            continue;
+        }
+        if (fputs(line, dest) == EOF)
+            goto cleanup;
+    }
+    if (ferror(source))
+        goto cleanup;
+    if (fclose(source) != 0) {
+        source = NULL;
+        goto cleanup;
+    }
+    source = NULL;
+
+    if (fflush(dest) != 0 || fsync(fileno(dest)) != 0)
+        goto cleanup;
+    if (fclose(dest) != 0) {
+        dest = NULL;
+        goto cleanup;
+    }
+    dest = NULL;
+
+    if (rename(temp_path, path) != 0)
+        goto cleanup;
+    temp_path[0] = '\0';
+    rv = 0;
+
+    if (skipped > 0)
+        printf("Excluded %d temporary SPA grant rule(s) from the reboot snapshot.\n",
+                skipped);
+
+cleanup:
+    if (source != NULL)
+        fclose(source);
+    if (dest != NULL)
+        fclose(dest);
+    if (raw_fd >= 0)
+        close(raw_fd);
+    if (temp_fd >= 0)
+        close(temp_fd);
+    remove(raw_path);
+    if (temp_path[0] != '\0')
+        remove(temp_path);
+    return rv;
 }
 
-static int save_runtime_persistent_rules(void) {
-    int saved = -1;
-
+static void persistent_rules_location(const char **dir, const char **path) {
     if (file_exists("/etc/debian_version") || file_exists("/etc/lsb-release")) {
-        saved = save_rules_to_path("/etc/iptables", "/etc/iptables/rules.v4");
-        if (saved == 0 && command_exists("netfilter-persistent"))
-            execute_cmd("netfilter-persistent save");
-        else if (saved == 0)
-            printf("Note: install netfilter-persistent or iptables-persistent to restore rules after reboot.\n");
-        return saved;
+        *dir = "/etc/iptables";
+        *path = "/etc/iptables/rules.v4";
+        return;
     }
 
     if (file_exists("/etc/redhat-release")) {
-        return save_rules_to_path("/etc/sysconfig", "/etc/sysconfig/iptables");
+        *dir = "/etc/sysconfig";
+        *path = "/etc/sysconfig/iptables";
+        return;
     }
 
     if (file_exists("/etc/iptables")) {
-        saved = save_rules_to_path("/etc/iptables", "/etc/iptables/rules.v4");
-        if (saved == 0)
-            return 0;
+        *dir = "/etc/iptables";
+        *path = "/etc/iptables/rules.v4";
+        return;
     }
 
-    return save_rules_to_path("/etc/sysconfig", "/etc/sysconfig/iptables");
+    *dir = "/etc/sysconfig";
+    *path = "/etc/sysconfig/iptables";
+}
+
+static int save_runtime_persistent_rules(void) {
+    const char *dir, *path;
+
+    persistent_rules_location(&dir, &path);
+    return save_rules_to_path(dir, path);
+}
+
+static const char *iptables_restore_executable(void) {
+    if (access("/usr/sbin/iptables-restore", X_OK) == 0)
+        return "/usr/sbin/iptables-restore";
+    if (access("/sbin/iptables-restore", X_OK) == 0)
+        return "/sbin/iptables-restore";
+    return NULL;
+}
+
+static int write_persistence_service(const char *rules_path) {
+    char cmd[MAX_CMD_LEN], temp_path[MAX_PATH_LEN];
+    const char *restore_exe = iptables_restore_executable();
+    FILE *unit = NULL;
+    int temp_fd = -1, rv = -1;
+
+    if (restore_exe == NULL) {
+        printf("Error: iptables-restore was not found in /usr/sbin or /sbin.\n");
+        return -1;
+    }
+
+    snprintf(cmd, sizeof(cmd), "mkdir -p /etc/systemd/system");
+    if (execute_cmd_status(cmd) != 0)
+        return -1;
+
+    if (snprintf(temp_path, sizeof(temp_path), "%s.XXXXXX",
+                PORTGUARD_IPTABLES_UNIT) >= (int) sizeof(temp_path))
+        return -1;
+
+    temp_fd = mkstemp(temp_path);
+    if (temp_fd < 0 || fchmod(temp_fd,
+                S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0)
+        goto cleanup;
+
+    unit = fdopen(temp_fd, "w");
+    if (unit == NULL)
+        goto cleanup;
+    temp_fd = -1;
+
+    if (fprintf(unit,
+                "[Unit]\n"
+                "Description=Restore PortGuard IPv4 firewall rules\n"
+                "DefaultDependencies=no\n"
+                "Wants=network-pre.target systemd-modules-load.service local-fs.target\n"
+                "After=systemd-modules-load.service local-fs.target\n"
+                "Before=network-pre.target fwknopd.service shutdown.target\n"
+                "Conflicts=shutdown.target\n"
+                "ConditionPathExists=%s\n"
+                "\n"
+                "[Service]\n"
+                "Type=oneshot\n"
+                "ExecStart=/bin/sh -c 'exec %s < %s'\n"
+                "RemainAfterExit=yes\n"
+                "\n"
+                "[Install]\n"
+                "WantedBy=multi-user.target\n",
+                rules_path, restore_exe, rules_path) < 0)
+        goto cleanup;
+
+    if (fflush(unit) != 0 || fsync(fileno(unit)) != 0)
+        goto cleanup;
+    if (fclose(unit) != 0) {
+        unit = NULL;
+        goto cleanup;
+    }
+    unit = NULL;
+
+    if (rename(temp_path, PORTGUARD_IPTABLES_UNIT) != 0)
+        goto cleanup;
+    temp_path[0] = '\0';
+    rv = 0;
+
+cleanup:
+    if (unit != NULL)
+        fclose(unit);
+    if (temp_fd >= 0)
+        close(temp_fd);
+    if (temp_path[0] != '\0')
+        remove(temp_path);
+    return rv;
+}
+
+static int enable_firewall_persistence(void) {
+    const char *dir, *path;
+    char choice;
+    int input_rv;
+
+    printf("\nEnable Firewall Persistence\n");
+    printf("===========================\n");
+    printf("This saves the current IPv4 firewall and restores it at boot.\n");
+    printf("Temporary SPA grant rules are excluded from the saved snapshot.\n");
+    printf("Enable or update reboot persistence now? (y/n): ");
+    input_rv = read_firewall_console_char(&choice);
+    if (input_rv == 0) {
+        printf("\nInput closed; persistence setup canceled.\n");
+        return 0;
+    }
+    if (input_rv < 0 || (choice != 'y' && choice != 'Y')) {
+        printf("Persistence setup canceled.\n");
+        return 0;
+    }
+
+    if (!command_exists("systemctl")) {
+        printf("Error: systemctl is required to enable reboot persistence.\n");
+        return -1;
+    }
+
+    persistent_rules_location(&dir, &path);
+    if (save_rules_to_path(dir, path) != 0) {
+        printf("Error: failed to save the firewall snapshot.\n");
+        return -1;
+    }
+    if (write_persistence_service(path) != 0) {
+        printf("Error: failed to write %s.\n", PORTGUARD_IPTABLES_UNIT);
+        return -1;
+    }
+    if (execute_cmd_status("systemctl daemon-reload") != 0
+            || execute_cmd_status("systemctl enable "
+                PORTGUARD_IPTABLES_SERVICE) != 0) {
+        printf("Error: failed to enable the PortGuard firewall restore service.\n");
+        return -1;
+    }
+
+    printf("Firewall reboot persistence enabled successfully.\n");
+    printf("Saved rules: %s\n", path);
+    printf("Systemd service: %s\n", PORTGUARD_IPTABLES_SERVICE);
+    return 0;
 }
 
 int initialize_firewall(fko_srv_options_t * const opts) {
@@ -2487,6 +2783,7 @@ int initialize_firewall(fko_srv_options_t * const opts) {
     const char *listener_proto;
     int port_count = 0;
     char choice;
+    int input_rv;
     unsigned int enable_udp_server = 0; 
     unsigned short port;
     printf("\nFirewall Initialization\n");
@@ -2497,9 +2794,13 @@ int initialize_firewall(fko_srv_options_t * const opts) {
     printf("Recommended: Have physical console access or\n");
     printf("a secondary SSH session open as backup.\n");
     printf("Continue? (y/n): ");
-    
-    scanf(" %c", &choice);
-    if (choice != 'y' && choice != 'Y') {
+
+    input_rv = read_firewall_console_char(&choice);
+    if (input_rv == 0) {
+        printf("\nInput closed; initialization canceled.\n");
+        return 0;
+    }
+    if (input_rv < 0 || (choice != 'y' && choice != 'Y')) {
         printf("Initialization canceled.\n");
         return 0;
     }
@@ -2521,8 +2822,15 @@ int initialize_firewall(fko_srv_options_t * const opts) {
         return -1;
     // Configure ports to open
     printf("\nConfigure additional ports to open (y/n)? ");
-    scanf(" %c", &choice);
-    while(getchar() != '\n'); 
+    input_rv = read_firewall_console_char(&choice);
+    if (input_rv == 0) {
+        printf("\nInput closed; initialization canceled.\n");
+        return 0;
+    }
+    if (input_rv < 0) {
+        printf("Invalid response; initialization canceled.\n");
+        return 0;
+    }
     if (choice == 'y' || choice == 'Y') {
         printf("\nEnter ports to open (protocol port, e.g., 'tcp 22' or 'udp 53')\n");
         printf("Enter 'done' when finished (up to %d total allow ports):\n", MAX_PORTS);
@@ -2534,13 +2842,10 @@ int initialize_firewall(fko_srv_options_t * const opts) {
             int add_rv;
             printf("Port %d (format 'proto port' or 'done'): ", port_count + 1);
             
-            // Read entire line
-            if (fgets(input, sizeof(input), stdin) == NULL) {
-                break;  // Handle EOF or error
+            if (!read_firewall_console_line(input, sizeof(input))) {
+                printf("\nInput closed; initialization canceled.\n");
+                return 0;
             }
-            
-            // Remove newline
-            input[strcspn(input, "\n")] = '\0';
             
             // Check for done command
             if (strcmp(input, "done") == 0) {
@@ -2617,6 +2922,9 @@ int initialize_firewall(fko_srv_options_t * const opts) {
         printf("Warning: failed to save persistent firewall rules.\n");
         printf("The active rules were applied, but they may not survive reboot.\n");
     }
+    else if (!file_exists(PORTGUARD_IPTABLES_UNIT)) {
+        printf("Rules snapshot saved. Select option 6 to enable restore at boot.\n");
+    }
     
     printf("\nFirewall INPUT chain initialized successfully.\n");
     list_rules();
@@ -2630,13 +2938,16 @@ void save_persistent_rules() {
         printf("Warning: failed to save persistent firewall rules.\n");
         printf("The active rules were applied, but they may not survive reboot.\n");
     }
+    else if (!file_exists(PORTGUARD_IPTABLES_UNIT)) {
+        printf("Rules snapshot saved. Select option 6 to enable restore at boot.\n");
+    }
 }
 void add_port_rule() {
     char protocol[4];
     char port[16];
     char cmd[MAX_CMD_LEN];
     char check_cmd[MAX_CMD_LEN];
-    FILE *fp;
+    int input_rv;
     
     printf("\nAdd Port Rule\n");
     printf("=============\n");
@@ -2644,9 +2955,13 @@ void add_port_rule() {
     // Get protocol input with validation
     while (1) {
         printf("Protocol (tcp/udp): ");
-        if (scanf("%3s", protocol) != 1) {
+        input_rv = read_firewall_console_word(protocol, sizeof(protocol));
+        if (input_rv == 0) {
+            printf("\nInput closed; operation canceled.\n");
+            return;
+        }
+        if (input_rv < 0) {
             printf("Invalid input.\n");
-            while (getchar() != '\n'); // Clear input buffer
             continue;
         }
         
@@ -2659,15 +2974,17 @@ void add_port_rule() {
     // Get port input with validation
     while (1) {
         printf("Port number: ");
-        if (scanf("%15s", port) != 1) {
+        input_rv = read_firewall_console_word(port, sizeof(port));
+        if (input_rv == 0) {
+            printf("\nInput closed; operation canceled.\n");
+            return;
+        }
+        if (input_rv < 0) {
             printf("Invalid input.\n");
-            while (getchar() != '\n'); // Clear input buffer
             continue;
         }
-        
-        char *endptr;
-        long port_num = strtol(port, &endptr, 10);
-        if (*endptr != '\0' || port_num < 1 || port_num > 65535) {
+
+        if (!valid_port_string(port)) {
             printf("Error: Port must be 1-65535.\n");
             continue;
         }
@@ -2686,10 +3003,12 @@ void add_port_rule() {
         
         printf("Add anyway? (y/n): ");
         char confirm_dup;
-        scanf(" %c", &confirm_dup);
-        while (getchar() != '\n'); // Clear input buffer
-        
-        if (confirm_dup != 'y' && confirm_dup != 'Y') {
+        input_rv = read_firewall_console_char(&confirm_dup);
+        if (input_rv == 0) {
+            printf("\nInput closed; operation canceled.\n");
+            return;
+        }
+        if (input_rv < 0 || (confirm_dup != 'y' && confirm_dup != 'Y')) {
             printf("Operation canceled.\n");
             return;
         }
@@ -2703,11 +3022,17 @@ void add_port_rule() {
     printf("Confirm? (y/n): ");
     
     char confirm;
-    scanf(" %c", &confirm);
-    while (getchar() != '\n'); // Clear input buffer
-    
-    if (confirm == 'y' || confirm == 'Y') {
-        execute_cmd(cmd);
+    input_rv = read_firewall_console_char(&confirm);
+    if (input_rv == 0) {
+        printf("\nInput closed; operation canceled.\n");
+        return;
+    }
+
+    if (input_rv > 0 && (confirm == 'y' || confirm == 'Y')) {
+        if (execute_cmd_status(cmd) != 0) {
+            printf("Rule was not added.\n");
+            return;
+        }
         save_persistent_rules();
         printf("Rule added successfully.\n");
     } else {
@@ -2717,6 +3042,7 @@ void add_port_rule() {
 
 void delete_rule() {
     int rule_num;
+    int input_rv;
     char cmd[MAX_CMD_LEN];
     
     list_rules();
@@ -2724,7 +3050,15 @@ void delete_rule() {
     printf("\nDelete Rule\n");
     printf("===========\n");
     printf("Enter rule number to delete: ");
-    scanf("%d", &rule_num);
+    input_rv = read_firewall_console_int(&rule_num, 1, 1000000);
+    if (input_rv == 0) {
+        printf("\nInput closed; operation canceled.\n");
+        return;
+    }
+    if (input_rv < 0) {
+        printf("Invalid rule number; operation canceled.\n");
+        return;
+    }
     
     snprintf(cmd, MAX_CMD_LEN, "iptables -D INPUT %d", rule_num);
     
@@ -2732,10 +3066,17 @@ void delete_rule() {
     printf("Confirm? (y/n): ");
     
     char confirm;
-    scanf(" %c", &confirm);
+    input_rv = read_firewall_console_char(&confirm);
+    if (input_rv == 0) {
+        printf("\nInput closed; operation canceled.\n");
+        return;
+    }
     
-    if (confirm == 'y' || confirm == 'Y') {
-        execute_cmd(cmd);
+    if (input_rv > 0 && (confirm == 'y' || confirm == 'Y')) {
+        if (execute_cmd_status(cmd) != 0) {
+            printf("Rule was not deleted.\n");
+            return;
+        }
         save_persistent_rules();
         printf("Rule deleted successfully.\n");
     } else {
@@ -2751,6 +3092,7 @@ void show_menu() {
     printf("3. Add port rule\n");
     printf("4. Delete rule\n");
     printf("5. Configure Telegram notifications\n");
+    printf("6. Enable/update reboot persistence\n");
     printf("0. Exit\n");
     printf("====================\n");
     printf("Select option: ");
@@ -2762,10 +3104,18 @@ int firewall_cmds(fko_srv_options_t * const opts) {
         return 1;
     }
 
-    int choice;
-    do {
+    int choice, input_rv;
+    while (1) {
         show_menu();
-        scanf("%d", &choice);
+        input_rv = read_firewall_console_int(&choice, 0, 6);
+        if (input_rv == 0) {
+            printf("\nInput closed; exiting firewall console.\n");
+            break;
+        }
+        if (input_rv < 0) {
+            printf("Invalid option. Enter a number from 0 to 6.\n");
+            continue;
+        }
         
         switch(choice) {
             case 1:
@@ -2781,16 +3131,18 @@ int firewall_cmds(fko_srv_options_t * const opts) {
                 delete_rule();
                 break;
             case 5:
-                while(getchar() != '\n' && !feof(stdin));
                 telegram_configure_console(opts);
+                break;
+            case 6:
+                enable_firewall_persistence();
                 break;
             case 0:
                 printf("Exiting...\n");
-                break;
+                return 0;
             default:
-                printf("Invalid option\n");
+                break;
         }
-    } while (choice != 0);
+    }
     
     return 0;
 }

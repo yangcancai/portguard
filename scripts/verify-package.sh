@@ -20,7 +20,8 @@ Usage:
 The verifier installs the local .deb/.rpm, checks first-start key generation,
 writes a temporary fwknopd config, checks parser/QR behavior, verifies dynamic
 libraries, checks UDP configuration reload and Telegram console handling, and
-checks fw-console firewall persistence/rebuild behavior when iptables is usable.
+checks fw-console input handling, reboot persistence, and firewall rebuild
+behavior when iptables is usable.
 USAGE
 }
 
@@ -511,6 +512,49 @@ count_matching_rules() {
   awk -v pattern="$pattern" 'BEGIN { count = 0 } $0 ~ pattern { count++ } END { print count }' "$source"
 }
 
+verify_fw_console_input_handling() {
+  local out status count
+
+  log "checking fwknopd --fw-console exits cleanly when input closes"
+  out="$(mktemp /tmp/portguard-fw-console-input.XXXXXX)"
+  trap 'rm -f "$out"' RETURN
+
+  set +e
+  timeout 3 fwknopd \
+    --fw-console \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf </dev/null > "$out" 2>&1
+  status="$?"
+  set -e
+  [ "$status" = "0" ] \
+    || fail "fw-console did not exit cleanly on immediate EOF (status ${status})"
+  grep -q 'Input closed; exiting firewall console' "$out" \
+    || fail "fw-console did not explain that its input was closed"
+
+  set +e
+  printf '2\n' | timeout 3 fwknopd \
+    --fw-console \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf > "$out" 2>&1
+  status="$?"
+  set -e
+  [ "$status" = "0" ] \
+    || fail "fw-console repeated the previous menu action after EOF (status ${status})"
+  count="$(grep -c 'Current INPUT Chain Rules' "$out" || true)"
+  [ "$count" = "1" ] \
+    || fail "fw-console listed rules ${count} times after one menu selection"
+
+  printf 'not-a-number\n0\n' | timeout 3 fwknopd \
+    --fw-console \
+    -c /etc/fwknop/fwknopd.conf \
+    -a /etc/fwknop/access.conf > "$out" 2>&1
+  grep -q 'Invalid option. Enter a number from 0 to 6.' "$out" \
+    || fail "fw-console did not reject a non-numeric menu option"
+
+  rm -f "$out"
+  trap - RETURN
+}
+
 verify_fw_console_input_rebuild() {
   local backup prepared after_first after before_non_input after_non_input out chain count
 
@@ -645,37 +689,97 @@ verify_fw_console_ssh_fallback() {
 
 verify_fw_console_persistence() {
   local family="$1"
+  local backup mock_dir rules_dir rules_path
+
+  if ! iptables_capable; then
+    log "iptables modification is unavailable; skipping fw-console persistence check"
+    return 0
+  fi
 
   case "$family" in
     debian)
-      log "checking fwknopd --fw-console persists rules to Debian path"
-      rm -rf /etc/iptables /etc/sysconfig
-      mkdir -p /etc/fwknop /run/fwknop
-      printf '3\ntcp\n65535\ny\n0\n' | timeout 10 fwknopd \
-        --fw-console \
-        -c /etc/fwknop/fwknopd.conf \
-        -a /etc/fwknop/access.conf > /tmp/fwknopd-fw-console.out
-      grep -q 'Executing: iptables-save > /etc/iptables/rules.v4' /tmp/fwknopd-fw-console.out \
-        || fail "fwknopd --fw-console did not save to /etc/iptables/rules.v4 on Debian"
-      [ -f /etc/iptables/rules.v4 ] \
-        || fail "fwknopd --fw-console did not create /etc/iptables/rules.v4"
-      [ ! -e /etc/sysconfig/iptables ] \
-        || fail "fwknopd --fw-console unexpectedly wrote /etc/sysconfig/iptables on Debian"
+      rules_dir="/etc/iptables"
+      rules_path="${rules_dir}/rules.v4"
       ;;
     rhel)
-      log "checking fwknopd --fw-console persists rules to RHEL path"
-      rm -rf /etc/sysconfig
-      mkdir -p /etc/fwknop /run/fwknop
-      printf '3\ntcp\n65535\ny\n0\n' | timeout 10 fwknopd \
-        --fw-console \
-        -c /etc/fwknop/fwknopd.conf \
-        -a /etc/fwknop/access.conf > /tmp/fwknopd-fw-console.out
-      grep -q 'Executing: iptables-save > /etc/sysconfig/iptables' /tmp/fwknopd-fw-console.out \
-        || fail "fwknopd --fw-console did not save to /etc/sysconfig/iptables on RHEL"
-      [ -f /etc/sysconfig/iptables ] \
-        || fail "fwknopd --fw-console did not create /etc/sysconfig/iptables"
+      rules_dir="/etc/sysconfig"
+      rules_path="${rules_dir}/iptables"
       ;;
   esac
+
+  log "checking fwknopd --fw-console enables reboot persistence on ${family}"
+  backup="$(mktemp /tmp/portguard-fw-persistence-before.XXXXXX)"
+  mock_dir="$(mktemp -d /tmp/portguard-systemctl-mock.XXXXXX)"
+  iptables-save > "$backup"
+  (
+    trap 'rc=$?; if [ "$rc" -ne 0 ] && [ -f /tmp/fwknopd-fw-console.out ]; then cat /tmp/fwknopd-fw-console.out >&2; fi; iptables-restore < "$backup" >/dev/null 2>&1 || true; rm -rf "$backup" "$mock_dir"; rm -f /etc/systemd/system/portguard-iptables-restore.service /tmp/portguard-systemctl.args /tmp/fwknopd-fw-console.out' EXIT
+
+    cat > "${mock_dir}/systemctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> /tmp/portguard-systemctl.args
+exit 0
+EOF
+    chmod 0755 "${mock_dir}/systemctl"
+    rm -f "$rules_path" /etc/systemd/system/portguard-iptables-restore.service \
+      /tmp/portguard-systemctl.args
+    mkdir -p "$rules_dir" /etc/fwknop /run/fwknop
+
+    iptables -I INPUT 1 -p tcp --dport 65431 -m comment \
+      --comment '_exp_4102444800' -j ACCEPT
+
+    printf '3\ntcp\n65535\ny\n6\ny\n0\n' \
+      | env PATH="${mock_dir}:${PATH}" timeout 10 fwknopd \
+          --fw-console \
+          -c /etc/fwknop/fwknopd.conf \
+          -a /etc/fwknop/access.conf > /tmp/fwknopd-fw-console.out
+
+    grep -q "Saving active firewall rules to ${rules_path}" \
+      /tmp/fwknopd-fw-console.out \
+      || fail "fw-console did not save rules to ${rules_path}"
+    grep -q 'Firewall reboot persistence enabled successfully' \
+      /tmp/fwknopd-fw-console.out \
+      || fail "fw-console did not report successful reboot persistence"
+    [ -f "$rules_path" ] \
+      || fail "fw-console did not create ${rules_path}"
+    [ "$(stat -c '%a' "$rules_path")" = "600" ] \
+      || fail "fw-console did not secure ${rules_path} with mode 600"
+    ! grep -q '_exp_' "$rules_path" \
+      || fail "fw-console persisted a temporary SPA grant rule"
+    iptables -C INPUT -p tcp --dport 65431 -m comment \
+      --comment '_exp_4102444800' -j ACCEPT \
+      || fail "saving persistence changed the active temporary SPA rule"
+
+    iptables -D INPUT -p tcp --dport 65535 -j ACCEPT
+    iptables-restore < "$rules_path"
+    iptables -C INPUT -p tcp --dport 65535 -j ACCEPT \
+      || fail "the saved firewall snapshot did not restore a persistent rule"
+    if iptables -C INPUT -p tcp --dport 65431 -m comment \
+        --comment '_exp_4102444800' -j ACCEPT >/dev/null 2>&1; then
+      fail "the saved firewall snapshot restored a temporary SPA grant rule"
+    fi
+
+    [ -f /etc/systemd/system/portguard-iptables-restore.service ] \
+      || fail "fw-console did not create the PortGuard restore service"
+    grep -Fq "ConditionPathExists=${rules_path}" \
+      /etc/systemd/system/portguard-iptables-restore.service \
+      || fail "restore service uses the wrong rules path"
+    grep -Fq "Before=network-pre.target fwknopd.service shutdown.target" \
+      /etc/systemd/system/portguard-iptables-restore.service \
+      || fail "restore service is not ordered before fwknopd"
+    grep -Fq "< ${rules_path}" \
+      /etc/systemd/system/portguard-iptables-restore.service \
+      || fail "restore service does not load ${rules_path}"
+    grep -qx 'daemon-reload' /tmp/portguard-systemctl.args \
+      || fail "fw-console did not reload systemd after writing the service"
+    grep -qx 'enable portguard-iptables-restore.service' \
+      /tmp/portguard-systemctl.args \
+      || fail "fw-console did not enable the restore service"
+
+    if [ "$family" = "debian" ]; then
+      [ ! -e /etc/sysconfig/iptables ] \
+        || fail "fw-console unexpectedly wrote /etc/sysconfig/iptables on Debian"
+    fi
+  )
 }
 
 main() {
@@ -693,6 +797,7 @@ main() {
   verify_fwknopd
   verify_telegram_console
   verify_udp_reload
+  verify_fw_console_input_handling
   verify_fw_console_persistence "$family"
   verify_fw_console_ssh_fallback
   verify_fw_console_input_rebuild
