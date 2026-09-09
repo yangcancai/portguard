@@ -4,9 +4,10 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=forking
-PIDFile=/run/fwknop/fwknopd.pid
-ExecStart=/usr/sbin/fwknopd
+Type=simple
+RuntimeDirectory=fwknop
+RuntimeDirectoryMode=0700
+ExecStart=/usr/sbin/fwknopd --foreground
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 

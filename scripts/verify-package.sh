@@ -299,19 +299,30 @@ EOF
 }
 
 verify_installed_files() {
+  local systemd_unit
+
   assert_executable /usr/sbin/fwknopd
   assert_file /etc/fwknop/fwknopd.conf
   assert_file /etc/fwknop/access.conf
 
   if [ -f /lib/systemd/system/fwknopd.service ]; then
-    grep -q 'ExecStart=/usr/sbin/fwknopd' /lib/systemd/system/fwknopd.service \
-      || fail "systemd unit does not start /usr/sbin/fwknopd"
+    systemd_unit=/lib/systemd/system/fwknopd.service
   elif [ -f /usr/lib/systemd/system/fwknopd.service ]; then
-    grep -q 'ExecStart=/usr/sbin/fwknopd' /usr/lib/systemd/system/fwknopd.service \
-      || fail "systemd unit does not start /usr/sbin/fwknopd"
+    systemd_unit=/usr/lib/systemd/system/fwknopd.service
   else
     fail "missing systemd unit"
   fi
+
+  grep -q '^Type=simple$' "$systemd_unit" \
+    || fail "systemd unit does not run fwknopd as a foreground service"
+  grep -q '^RuntimeDirectory=fwknop$' "$systemd_unit" \
+    || fail "systemd unit does not create /run/fwknop"
+  grep -q '^RuntimeDirectoryMode=0700$' "$systemd_unit" \
+    || fail "systemd unit does not protect /run/fwknop"
+  grep -q '^ExecStart=/usr/sbin/fwknopd --foreground$' "$systemd_unit" \
+    || fail "systemd unit does not start /usr/sbin/fwknopd in foreground mode"
+  ! grep -q '^PIDFile=' "$systemd_unit" \
+    || fail "systemd unit still relies on a racy PIDFile declaration"
 }
 
 verify_fwknopd() {

@@ -89,8 +89,16 @@ assert_file /etc/fwknop/fwknopd.conf
 assert_file /etc/fwknop/access.conf
 
 unit="$(service_file)" || fail "missing fwknopd systemd unit"
-grep -q 'ExecStart=.*fwknopd' "$unit" \
-  || fail "systemd unit does not start fwknopd: $unit"
+grep -q '^Type=simple$' "$unit" \
+  || fail "systemd unit does not run fwknopd as a foreground service: $unit"
+grep -q '^RuntimeDirectory=fwknop$' "$unit" \
+  || fail "systemd unit does not create /run/fwknop: $unit"
+grep -q '^RuntimeDirectoryMode=0700$' "$unit" \
+  || fail "systemd unit does not protect /run/fwknop: $unit"
+grep -q '^ExecStart=/usr/sbin/fwknopd --foreground$' "$unit" \
+  || fail "systemd unit does not start fwknopd in foreground mode: $unit"
+! grep -q '^PIDFile=' "$unit" \
+  || fail "systemd unit still relies on a racy PIDFile declaration: $unit"
 
 grep -q "UDPSERV_PORT[[:space:]]*${VERIFY_KNOCK_PORT}" /etc/fwknop/fwknopd.conf \
   || fail "fwknopd.conf does not contain expected UDP server port"

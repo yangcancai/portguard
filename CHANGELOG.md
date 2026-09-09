@@ -142,6 +142,8 @@ Compatible client: **PortGuard Client 2.2.1 or later**.
   controls to `--fw-console`.
 - Updated the PortGuard version and help banners and added concise Telegram
   setup guidance linking to the official documentation.
+- Changed the systemd unit to supervise `fwknopd` in foreground mode and create
+  `/run/fwknop` itself, eliminating the startup PID-file race seen on Ubuntu.
 
 [View v2.6.11-pg7 on GitHub](https://github.com/yangcancai/portguard/releases/tag/v2.6.11-pg7)
 
